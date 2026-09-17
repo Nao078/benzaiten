@@ -32,11 +32,81 @@ enum AppCommand {
     OpenOriginalLyrics,
     OpenReadingLyrics,
     ShowExternalTools,
+    WriteAudioTags(AudioTagFormat),
+}
+
+/// Which audio container to write tags for, chosen from the "音声ファイルへ
+/// タグを書き込む" submenu. Only FLAC and M4A have a generic lyrics tag that
+/// lofty can write (Vorbis Comment / `©lyr`); MP3's ID3v2 has no equivalent
+/// without a dedicated SYLT frame, so it keeps using a companion .lrc file
+/// instead, same as before this feature existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioTagFormat {
+    Mp3WithLrc,
+    Flac,
+    M4a,
+}
+
+impl AudioTagFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            AudioTagFormat::Mp3WithLrc => "mp3",
+            AudioTagFormat::Flac => "flac",
+            AudioTagFormat::M4a => "m4a",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AudioTagFormat::Mp3WithLrc => "MP3",
+            AudioTagFormat::Flac => "FLAC",
+            AudioTagFormat::M4a => "M4A",
+        }
+    }
+
+    /// ffmpeg codec arguments used only when converting into this format
+    /// from a lossless source. A reasonably high quality/bitrate is used
+    /// since this is meant to be a single, one-time lossy encode.
+    fn ffmpeg_codec_args(self) -> &'static [&'static str] {
+        match self {
+            AudioTagFormat::Mp3WithLrc => &["-c:a", "libmp3lame", "-q:a", "2"],
+            AudioTagFormat::Flac => &["-c:a", "flac"],
+            AudioTagFormat::M4a => &["-c:a", "aac", "-b:a", "256k"],
+        }
+    }
+}
+
+/// Guesses which [`AudioTagFormat`] applies to `path` from its extension, so
+/// the submenu can gray out the entries that don't match the loaded audio
+/// file. The actual write still re-detects the real container via lofty, so
+/// a misleading extension can't cause lyrics to land in the wrong tag.
+fn detected_audio_tag_format(path: &Path) -> Option<AudioTagFormat> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "mp3" => Some(AudioTagFormat::Mp3WithLrc),
+        "flac" => Some(AudioTagFormat::Flac),
+        "m4a" | "m4b" | "mp4" => Some(AudioTagFormat::M4a),
+        _ => None,
+    }
+}
+
+/// Extensions this app treats as lossless, and therefore safe to freely
+/// convert to any of the three tag-embedding targets without compounding
+/// lossy compression. Converting a *lossy* source (MP3, or AAC in an M4A)
+/// would either double-compress it (going to another lossy format) or wrap
+/// already-degraded audio in a lossless container for no benefit, so only
+/// each lossy format's own matching menu entry stays enabled for those.
+///
+/// `.m4a` is assumed to hold lossy AAC, the overwhelming common case; this
+/// app does not attempt to detect lossless ALAC inside an M4A container.
+fn is_lossless_audio_extension(extension: &str) -> bool {
+    matches!(extension, "wav" | "flac")
 }
 use eframe::egui;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
 
@@ -395,6 +465,7 @@ impl BenzaitenApp {
             AppCommand::OpenOriginalLyrics => self.open_original_lyrics_dialog(),
             AppCommand::OpenReadingLyrics => self.open_reading_lyrics_dialog(),
             AppCommand::ShowExternalTools => self.show_external_tools = true,
+            AppCommand::WriteAudioTags(format) => self.confirm_and_write_audio_tags(format),
         }
     }
 
@@ -741,7 +812,94 @@ impl BenzaitenApp {
         }
     }
 
-    fn write_audio_tags(&mut self) {
+    fn confirm_and_write_audio_tags(&mut self, format: AudioTagFormat) {
+        if self.project.audio_path.as_os_str().is_empty() {
+            return;
+        }
+        let description = if detected_audio_tag_format(&self.project.audio_path) == Some(format) {
+            match format {
+                AudioTagFormat::Mp3WithLrc => {
+                    "音声ファイルへタグを書き込み、同じ場所にLRCファイルを保存します。\
+                     初回は音声ファイルの同じ場所にバックアップを作成します。続行しますか？"
+                        .to_owned()
+                }
+                AudioTagFormat::Flac | AudioTagFormat::M4a => {
+                    "音声ファイルへタグを書き込み、歌詞を埋め込みます。\
+                     初回は同じ場所にバックアップを作成します。続行しますか？"
+                        .to_owned()
+                }
+            }
+        } else {
+            format!(
+                "音声を{}へ変換した新しいファイルを同じ場所に作成し、そちらへタグと歌詞を書き込みます。\
+                 元の音声ファイルは変更しません。続行しますか？",
+                format.label()
+            )
+        };
+        if rfd::MessageDialog::new()
+            .set_title("音声タグの書込み")
+            .set_description(description)
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show()
+            == rfd::MessageDialogResult::Yes
+        {
+            self.write_audio_tags(format);
+        }
+    }
+
+    /// Converts the current audio to `format` via ffmpeg, writing a new file
+    /// alongside the original (which is left untouched) and returning its
+    /// path. Only called for a lossless source, so this is a single,
+    /// one-time lossy encode when the target itself is lossy — never a
+    /// second generation of lossy compression.
+    fn convert_audio_for_tag_format(&self, format: AudioTagFormat) -> Result<PathBuf, String> {
+        let target_path = self.project.audio_path.with_extension(format.extension());
+        if target_path.exists() {
+            return Err(format!(
+                "変換先ファイルが既に存在するため中止しました: {}",
+                target_path.display()
+            ));
+        }
+        let ffmpeg = PathBuf::from(&self.ffmpeg);
+        let mut arguments: Vec<&Path> =
+            vec![Path::new("-y"), Path::new("-i"), &self.project.audio_path];
+        arguments.extend(format.ffmpeg_codec_args().iter().map(Path::new));
+        arguments.push(&target_path);
+        crate::process::run(&ffmpeg, &arguments, Arc::new(AtomicBool::new(false)))
+            .map(|_| target_path)
+    }
+
+    fn write_audio_tags(&mut self, format: AudioTagFormat) {
+        // Render once up front and bail before touching the audio file at
+        // all if the lyrics aren't in an exportable state (missing
+        // timestamps, reversed order, ...) — the same validation the
+        // ordinary LRC export applies. Both the embedded-tag path and the
+        // companion-file path need this text.
+        let lyrics = match writer::render(&self.project) {
+            Ok(text) => text,
+            Err(error) => {
+                self.status = format!("歌詞(LRC)の生成に失敗したため書込みを中止しました: {error}");
+                return;
+            }
+        };
+
+        let converted = detected_audio_tag_format(&self.project.audio_path) != Some(format);
+        if converted {
+            match self.convert_audio_for_tag_format(format) {
+                Ok(converted_path) => {
+                    // Same audio content, just re-encoded, so the existing
+                    // line timestamps are still valid — unlike swapping to a
+                    // genuinely different audio file, nothing needs resetting.
+                    self.project.audio_path = converted_path;
+                    self.changed();
+                }
+                Err(error) => {
+                    self.status = format!("音声の変換に失敗しました: {error}");
+                    return;
+                }
+            }
+        }
+
         let position = self
             .player
             .as_ref()
@@ -749,11 +907,13 @@ impl BenzaitenApp {
             .unwrap_or(0);
         let was_playing = self.player.as_ref().is_some_and(AudioPlayer::is_playing);
         self.player = None;
+        let embed_lyrics = matches!(format, AudioTagFormat::Flac | AudioTagFormat::M4a);
         match crate::metadata::write(
             &self.project.audio_path,
             &self.project.title,
             &self.project.artist,
             &self.project.metadata,
+            embed_lyrics.then_some(lyrics.as_str()),
         ) {
             Ok(backup) => {
                 self.load_audio(false);
@@ -763,10 +923,37 @@ impl BenzaitenApp {
                         let _ = player.play();
                     }
                 }
-                self.status = format!(
-                    "音声タグを書き込みました（バックアップ: {}）",
-                    backup.display()
-                );
+                let converted_prefix = if converted {
+                    format!(
+                        "{}へ変換したファイルを作成し、",
+                        self.project.audio_path.display()
+                    )
+                } else {
+                    String::new()
+                };
+                if format == AudioTagFormat::Mp3WithLrc {
+                    let lrc_path = self.project.audio_path.with_extension("lrc");
+                    match writer::export(&lrc_path, &self.project) {
+                        Ok(()) => {
+                            self.status = format!(
+                                "{converted_prefix}音声タグとLRCを書き込みました（バックアップ: {}、LRC: {}）",
+                                backup.display(),
+                                lrc_path.display()
+                            );
+                        }
+                        Err(error) => {
+                            self.status = format!(
+                                "{converted_prefix}音声タグは書き込みましたが、LRC出力に失敗しました（バックアップ: {}）: {error}",
+                                backup.display()
+                            );
+                        }
+                    }
+                } else {
+                    self.status = format!(
+                        "{converted_prefix}音声タグと歌詞を書き込みました（バックアップ: {}）",
+                        backup.display()
+                    );
+                }
             }
             Err(error) => {
                 self.load_audio(false);
@@ -927,6 +1114,31 @@ impl eframe::App for BenzaitenApp {
                     if ui.button("カタカナ歌詞を開く").clicked() {
                         command = Some(AppCommand::OpenReadingLyrics);
                     }
+                    ui.separator();
+                    ui.menu_button("音声ファイルへタグを書き込む", |ui| {
+                        let detected = detected_audio_tag_format(&self.project.audio_path);
+                        // A lossless source (WAV/FLAC) can be freely converted to
+                        // any target; a lossy source (MP3, M4A) only allows its
+                        // own matching entry so we never compound lossy
+                        // compression or wrap already-lossy audio pointlessly.
+                        let lossless_source = self
+                            .project
+                            .audio_path
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            .map(|value| value.to_ascii_lowercase())
+                            .is_some_and(|extension| is_lossless_audio_extension(&extension));
+                        for (label, format) in [
+                            ("MP3 + LRC", AudioTagFormat::Mp3WithLrc),
+                            ("FLAC", AudioTagFormat::Flac),
+                            ("M4A", AudioTagFormat::M4a),
+                        ] {
+                            let enabled = detected == Some(format) || lossless_source;
+                            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                command = Some(AppCommand::WriteAudioTags(format));
+                            }
+                        }
+                    });
                 });
                 ui.menu_button("編集", |ui| {
                     if ui.button("歌唱向けカタカナ自動生成").clicked() {
@@ -1242,373 +1454,397 @@ impl eframe::App for BenzaitenApp {
                 .id_salt("central-content-scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-            ui.heading(if self.dirty {
-                "弁才天 *"
-            } else {
-                "弁才天"
-            });
-            let mut metadata_changed = false;
-            let mut write_tags = false;
-            egui::CollapsingHeader::new("音楽情報・アルバムアート")
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            if let Some(texture) = &self.artwork_texture {
-                                ui.image((texture.id(), egui::vec2(128.0, 128.0)));
-                            } else {
-                                ui.allocate_ui(egui::vec2(128.0, 128.0), |ui| {
-                                    ui.centered_and_justified(|ui| ui.label("No Artwork"));
+                    ui.heading(if self.dirty {
+                        "弁才天 *"
+                    } else {
+                        "弁才天"
+                    });
+                    let mut metadata_changed = false;
+                    egui::CollapsingHeader::new("音楽情報・アルバムアート")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    if let Some(texture) = &self.artwork_texture {
+                                        ui.image((texture.id(), egui::vec2(128.0, 128.0)));
+                                    } else {
+                                        ui.allocate_ui(egui::vec2(128.0, 128.0), |ui| {
+                                            ui.centered_and_justified(|ui| ui.label("No Artwork"));
+                                        });
+                                    }
+                                    if ui.button("画像を選択").clicked() {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter(
+                                                "Image",
+                                                &["jpg", "jpeg", "png", "gif", "webp"],
+                                            )
+                                            .pick_file()
+                                        {
+                                            match std::fs::read(&path) {
+                                                Ok(bytes) => {
+                                                    self.project.metadata.artwork_path = Some(path);
+                                                    self.artwork_bytes = Some(bytes);
+                                                    self.artwork_texture = None;
+                                                    metadata_changed = true;
+                                                }
+                                                Err(error) => {
+                                                    self.status = format!("画像読込エラー: {error}")
+                                                }
+                                            }
+                                        }
+                                    }
                                 });
-                            }
-                            if ui.button("画像を選択").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("Image", &["jpg", "jpeg", "png", "gif", "webp"])
-                                    .pick_file()
-                                {
-                                    match std::fs::read(&path) {
-                                        Ok(bytes) => {
-                                            self.project.metadata.artwork_path = Some(path);
-                                            self.artwork_bytes = Some(bytes);
-                                            self.artwork_texture = None;
+                                ui.vertical(|ui| {
+                                    for (label, value) in [
+                                        ("曲名", &mut self.project.title),
+                                        ("アーティスト", &mut self.project.artist),
+                                        ("アルバム", &mut self.project.metadata.album),
+                                        (
+                                            "アルバムアーティスト",
+                                            &mut self.project.metadata.album_artist,
+                                        ),
+                                        ("ジャンル", &mut self.project.metadata.genre),
+                                    ] {
+                                        ui.horizontal(|ui| {
+                                            ui.label(label);
+                                            metadata_changed |=
+                                                ui.text_edit_singleline(value).changed();
+                                        });
+                                    }
+                                    ui.horizontal(|ui| {
+                                        let mut year = self.project.metadata.year.unwrap_or(0);
+                                        let mut track =
+                                            self.project.metadata.track_number.unwrap_or(0);
+                                        let mut disc =
+                                            self.project.metadata.disc_number.unwrap_or(0);
+                                        ui.label("年");
+                                        if ui
+                                            .add(egui::DragValue::new(&mut year).range(0..=9999))
+                                            .changed()
+                                        {
+                                            self.project.metadata.year =
+                                                (year != 0).then_some(year);
                                             metadata_changed = true;
                                         }
-                                        Err(error) => self.status = format!("画像読込エラー: {error}"),
-                                    }
-                                }
-                            }
-                        });
-                        ui.vertical(|ui| {
-                            for (label, value) in [
-                                ("曲名", &mut self.project.title),
-                                ("アーティスト", &mut self.project.artist),
-                                ("アルバム", &mut self.project.metadata.album),
-                                ("アルバムアーティスト", &mut self.project.metadata.album_artist),
-                                ("ジャンル", &mut self.project.metadata.genre),
-                            ] {
-                                ui.horizontal(|ui| {
-                                    ui.label(label);
-                                    metadata_changed |= ui.text_edit_singleline(value).changed();
+                                        ui.label("トラック");
+                                        if ui
+                                            .add(egui::DragValue::new(&mut track).range(0..=999))
+                                            .changed()
+                                        {
+                                            self.project.metadata.track_number =
+                                                (track != 0).then_some(track);
+                                            metadata_changed = true;
+                                        }
+                                        ui.label("ディスク");
+                                        if ui
+                                            .add(egui::DragValue::new(&mut disc).range(0..=99))
+                                            .changed()
+                                        {
+                                            self.project.metadata.disc_number =
+                                                (disc != 0).then_some(disc);
+                                            metadata_changed = true;
+                                        }
+                                    });
                                 });
-                            }
-                            ui.horizontal(|ui| {
-                                let mut year = self.project.metadata.year.unwrap_or(0);
-                                let mut track = self.project.metadata.track_number.unwrap_or(0);
-                                let mut disc = self.project.metadata.disc_number.unwrap_or(0);
-                                ui.label("年");
-                                if ui.add(egui::DragValue::new(&mut year).range(0..=9999)).changed() {
-                                    self.project.metadata.year = (year != 0).then_some(year);
-                                    metadata_changed = true;
-                                }
-                                ui.label("トラック");
-                                if ui.add(egui::DragValue::new(&mut track).range(0..=999)).changed() {
-                                    self.project.metadata.track_number = (track != 0).then_some(track);
-                                    metadata_changed = true;
-                                }
-                                ui.label("ディスク");
-                                if ui.add(egui::DragValue::new(&mut disc).range(0..=99)).changed() {
-                                    self.project.metadata.disc_number = (disc != 0).then_some(disc);
-                                    metadata_changed = true;
-                                }
                             });
-                            write_tags = ui
-                                .add_enabled(
-                                    !self.project.audio_path.as_os_str().is_empty(),
-                                    egui::Button::new("音声ファイルへタグを書き込む"),
-                                )
-                                .clicked();
                         });
-                    });
-                });
-            if metadata_changed {
-                self.changed();
-            }
-            if write_tags
-                && rfd::MessageDialog::new()
-                    .set_title("音声タグの書込み")
-                    .set_description("音声ファイルを更新します。初回は同じ場所にバックアップを作成します。続行しますか？")
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show()
-                    == rfd::MessageDialogResult::Yes
-            {
-                self.write_audio_tags();
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("歌詞表示");
-                ui.selectable_value(
-                    &mut self.lyrics_display_mode,
-                    LyricsDisplayMode::Original,
-                    "原文のみ",
-                );
-                ui.selectable_value(
-                    &mut self.lyrics_display_mode,
-                    LyricsDisplayMode::Reading,
-                    "カタカナのみ",
-                );
-                ui.selectable_value(
-                    &mut self.lyrics_display_mode,
-                    LyricsDisplayMode::OriginalAndReading,
-                    "原文 + カタカナ",
-                );
-                if ui
-                    .button("歌唱向けカタカナ自動生成")
-                    .on_hover_text("手動入力・カタカナTXTから読み込んだ行は上書きしません")
-                    .clicked()
-                {
-                    self.generate_readings();
-                }
-            });
-            let active_index = self
-                .player
-                .as_ref()
-                .and_then(|player| active_lyric_index(&self.project.lyrics, player.position_ms()));
-            if self.player.as_ref().is_some_and(AudioPlayer::is_playing) {
-                self.selected = active_index.or(self.selected);
-            }
-            let position = self.player.as_ref().map(|p| p.position_ms());
-            let duration = self.player.as_ref().and_then(|p| p.duration_ms());
-            let mut edited = false;
-            let selected = self
-                .selected
-                .or(active_index)
-                .filter(|index| *index < self.project.lyrics.len());
-            let mut set_to = None;
-            let mut shift_by = None;
-            let mut clear_time = false;
-            let mut seek_selected = false;
-            let mut navigate_to = None;
-            let mut reading_edit = None;
-            egui::Frame::group(ui.style())
-                .fill(egui::Color32::from_rgb(29, 34, 42))
-                .inner_margin(16.0)
-                .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.heading("現在の歌詞・時刻補正");
-                    if let Some(index) = selected {
-                        ui.label(format!("行 {} / {}", index + 1, self.project.lyrics.len()));
-                        if ui.add_enabled(index > 0, egui::Button::new("◀ 前の行")).clicked() {
-                            navigate_to = Some(index - 1);
-                        }
-                        if ui
-                            .add_enabled(
-                                index + 1 < self.project.lyrics.len(),
-                                egui::Button::new("次の行 ▶"),
-                            )
-                            .clicked()
-                        {
-                            navigate_to = Some(index + 1);
-                        }
+                    if metadata_changed {
+                        self.changed();
                     }
-                });
-                if let Some(index) = selected {
-                    let line = &self.project.lyrics[index];
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(&line.original_text)
-                            .size(24.0)
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    );
-                    let mut reading = line.reading_text.clone().unwrap_or_default();
-                    ui.horizontal(|ui| {
-                        ui.label("カタカナ");
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut reading)
-                                    .desired_width(ui.available_width()),
-                            )
-                            .changed()
-                        {
-                            reading_edit = Some((!reading.is_empty()).then_some(reading));
-                        }
-                    });
                     ui.separator();
-                    ui.horizontal_wrapped(|ui| {
-                        let mut start = line.start_ms.unwrap_or_else(|| position.unwrap_or(0));
-                        ui.label("開始時刻");
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut start)
-                                    .range(0..=duration.unwrap_or(u64::MAX))
-                                    .speed(10.0)
-                                    .suffix(" ms"),
-                            )
-                            .changed()
-                        {
-                            set_to = Some(start);
-                        }
-                        ui.strong(format_time(start));
-                        ui.separator();
-                        ui.label("調整幅");
-                        ui.add(
-                            egui::DragValue::new(&mut self.bulk_shift_ms)
-                                .range(1..=60_000)
-                                .speed(10.0)
-                                .suffix(" ms"),
+                    ui.horizontal(|ui| {
+                        ui.label("歌詞表示");
+                        ui.selectable_value(
+                            &mut self.lyrics_display_mode,
+                            LyricsDisplayMode::Original,
+                            "原文のみ",
+                        );
+                        ui.selectable_value(
+                            &mut self.lyrics_display_mode,
+                            LyricsDisplayMode::Reading,
+                            "カタカナのみ",
+                        );
+                        ui.selectable_value(
+                            &mut self.lyrics_display_mode,
+                            LyricsDisplayMode::OriginalAndReading,
+                            "原文 + カタカナ",
                         );
                         if ui
+                            .button("歌唱向けカタカナ自動生成")
+                            .on_hover_text("手動入力・カタカナTXTから読み込んだ行は上書きしません")
+                            .clicked()
+                        {
+                            self.generate_readings();
+                        }
+                    });
+                    let active_index = self.player.as_ref().and_then(|player| {
+                        active_lyric_index(&self.project.lyrics, player.position_ms())
+                    });
+                    if self.player.as_ref().is_some_and(AudioPlayer::is_playing) {
+                        self.selected = active_index.or(self.selected);
+                    }
+                    let position = self.player.as_ref().map(|p| p.position_ms());
+                    let duration = self.player.as_ref().and_then(|p| p.duration_ms());
+                    let mut edited = false;
+                    let selected = self
+                        .selected
+                        .or(active_index)
+                        .filter(|index| *index < self.project.lyrics.len());
+                    let mut set_to = None;
+                    let mut shift_by = None;
+                    let mut clear_time = false;
+                    let mut seek_selected = false;
+                    let mut navigate_to = None;
+                    let mut reading_edit = None;
+                    egui::Frame::group(ui.style())
+                        .fill(egui::Color32::from_rgb(29, 34, 42))
+                        .inner_margin(16.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.heading("現在の歌詞・時刻補正");
+                                if let Some(index) = selected {
+                                    ui.label(format!(
+                                        "行 {} / {}",
+                                        index + 1,
+                                        self.project.lyrics.len()
+                                    ));
+                                    if ui
+                                        .add_enabled(index > 0, egui::Button::new("◀ 前の行"))
+                                        .clicked()
+                                    {
+                                        navigate_to = Some(index - 1);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            index + 1 < self.project.lyrics.len(),
+                                            egui::Button::new("次の行 ▶"),
+                                        )
+                                        .clicked()
+                                    {
+                                        navigate_to = Some(index + 1);
+                                    }
+                                }
+                            });
+                            if let Some(index) = selected {
+                                let line = &self.project.lyrics[index];
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(&line.original_text)
+                                        .size(24.0)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                let mut reading = line.reading_text.clone().unwrap_or_default();
+                                ui.horizontal(|ui| {
+                                    ui.label("カタカナ");
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut reading)
+                                                .desired_width(ui.available_width()),
+                                        )
+                                        .changed()
+                                    {
+                                        reading_edit =
+                                            Some((!reading.is_empty()).then_some(reading));
+                                    }
+                                });
+                                ui.separator();
+                                ui.horizontal_wrapped(|ui| {
+                                    let mut start =
+                                        line.start_ms.unwrap_or_else(|| position.unwrap_or(0));
+                                    ui.label("開始時刻");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut start)
+                                                .range(0..=duration.unwrap_or(u64::MAX))
+                                                .speed(10.0)
+                                                .suffix(" ms"),
+                                        )
+                                        .changed()
+                                    {
+                                        set_to = Some(start);
+                                    }
+                                    ui.strong(format_time(start));
+                                    ui.separator();
+                                    ui.label("調整幅");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.bulk_shift_ms)
+                                            .range(1..=60_000)
+                                            .speed(10.0)
+                                            .suffix(" ms"),
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            line.start_ms.is_some(),
+                                            egui::Button::new(format!(
+                                                "−{} ms",
+                                                self.bulk_shift_ms
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        shift_by = Some(-self.bulk_shift_ms);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            line.start_ms.is_some(),
+                                            egui::Button::new(format!(
+                                                "＋{} ms",
+                                                self.bulk_shift_ms
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        shift_by = Some(self.bulk_shift_ms);
+                                    }
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("この行から再生").clicked() {
+                                        seek_selected = true;
+                                    }
+                                    if ui.button("時刻を解除").clicked() {
+                                        clear_time = true;
+                                    }
+                                });
+                                let score = line
+                                    .confidence
+                                    .map(|value| format!("{value:.2}"))
+                                    .unwrap_or_else(|| "—".into());
+                                ui.small(format!(
+                                    "照合指標: {score} / 時刻の由来: {:?}",
+                                    line.timestamp_source
+                                ));
+                                ui.small(
+                                    "ショートカット: Ctrl+←/→ = 10 ms、Ctrl+Shift+←/→ = 100 ms",
+                                );
+                            } else {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(24.0);
+                                    ui.label("タイムラインの歌詞ブロックを選択してください");
+                                    ui.add_space(24.0);
+                                });
+                            }
+                        });
+
+                    if let Some(index) = navigate_to {
+                        self.selected = Some(index);
+                        if let (Some(start), Some(player)) =
+                            (self.project.lyrics[index].start_ms, &mut self.player)
+                        {
+                            let _ = player.seek(start);
+                        }
+                    }
+
+                    if selected.is_some() && !ctx.wants_keyboard_input() {
+                        let keyboard_delta = ctx.input(|input| {
+                            if !input.modifiers.ctrl {
+                                None
+                            } else if input.key_pressed(egui::Key::ArrowLeft) {
+                                Some(if input.modifiers.shift { -100 } else { -10 })
+                            } else if input.key_pressed(egui::Key::ArrowRight) {
+                                Some(if input.modifiers.shift { 100 } else { 10 })
+                            } else {
+                                None
+                            }
+                        });
+                        shift_by = shift_by.or(keyboard_delta);
+                    }
+                    if let Some(index) = selected {
+                        if let Some(reading) = reading_edit {
+                            let line = &mut self.project.lyrics[index];
+                            line.reading_text = reading;
+                            line.reading_source =
+                                line.reading_text.as_ref().map(|_| ReadingSource::Manual);
+                            edited = true;
+                        }
+                        if let Some(ms) = set_to {
+                            lyric_editor::set_line_start(&mut self.project.lyrics, index, ms);
+                            edited = true;
+                        }
+                        if let Some(delta) = shift_by {
+                            lyric_editor::shift_line_start(
+                                &mut self.project.lyrics,
+                                index,
+                                delta,
+                                duration,
+                            );
+                            edited = true;
+                        }
+                        if clear_time {
+                            let line = &mut self.project.lyrics[index];
+                            line.start_ms = None;
+                            line.end_ms = None;
+                            line.confidence = None;
+                            line.timestamp_source = None;
+                            edited = true;
+                        }
+                        if seek_selected {
+                            if let (Some(ms), Some(player)) =
+                                (self.project.lyrics[index].start_ms, &mut self.player)
+                            {
+                                if let Err(error) = player.seek(ms) {
+                                    self.status = error;
+                                }
+                            }
+                        }
+                    }
+                    if edited {
+                        self.changed();
+                        self.sync_lyric_inputs_from_project();
+                    }
+                    ui.horizontal(|ui| {
+                        if self.job.is_some() {
+                            if ui.button("同期をキャンセル").clicked() {
+                                if let Some(job) = &self.job {
+                                    job.cancel();
+                                    self.generation = self.generation.wrapping_add(1);
+                                }
+                            }
+                        } else if ui
                             .add_enabled(
-                                line.start_ms.is_some(),
-                                egui::Button::new(format!("−{} ms", self.bulk_shift_ms)),
+                                !self.project.audio_path.as_os_str().is_empty()
+                                    && !self.project.lyrics.is_empty(),
+                                egui::Button::new("自動同期"),
                             )
                             .clicked()
                         {
-                            shift_by = Some(-self.bulk_shift_ms);
-                        }
-                        if ui
-                            .add_enabled(
-                                line.start_ms.is_some(),
-                                egui::Button::new(format!("＋{} ms", self.bulk_shift_ms)),
-                            )
-                            .clicked()
-                        {
-                            shift_by = Some(self.bulk_shift_ms);
+                            let language = crate::forced_alignment::tokenizer::resolve_language(
+                                &self.language,
+                                &self.project.lyrics,
+                            );
+                            let Ok(language) = language else {
+                                self.status = language.unwrap_err();
+                                return;
+                            };
+                            let japanese = language
+                                == crate::forced_alignment::tokenizer::AlignmentLanguage::Japanese;
+                            let settings = ToolSettings {
+                                ffmpeg: self.ffmpeg.clone().into(),
+                                model: if japanese {
+                                    self.japanese_model.clone().into()
+                                } else {
+                                    self.model.clone().into()
+                                },
+                                vocabulary: japanese
+                                    .then(|| self.japanese_vocabulary.clone().into()),
+                                language: language.code().into(),
+                                threads: self.alignment_threads,
+                            };
+                            match settings.validate_model(&self.project.lyrics) {
+                                Err(error) => self.status = error,
+                                Ok(()) => {
+                                    self.job_generation = self.generation;
+                                    self.job = Some(Job::start(
+                                        self.project.audio_path.clone(),
+                                        self.project.lyrics.clone(),
+                                        settings,
+                                    ));
+                                    self.job_started_at = Some(Instant::now());
+                                }
+                            }
                         }
                     });
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("この行から再生").clicked() {
-                            seek_selected = true;
-                        }
-                        if ui.button("時刻を解除").clicked() {
-                            clear_time = true;
-                        }
-                    });
-                    let score = line
-                        .confidence
-                        .map(|value| format!("{value:.2}"))
-                        .unwrap_or_else(|| "—".into());
-                    ui.small(format!(
-                        "照合指標: {score} / 時刻の由来: {:?}",
-                        line.timestamp_source
-                    ));
-                    ui.small("ショートカット: Ctrl+←/→ = 10 ms、Ctrl+Shift+←/→ = 100 ms");
-                } else {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(24.0);
-                        ui.label("タイムラインの歌詞ブロックを選択してください");
-                        ui.add_space(24.0);
-                    });
-                }
-            });
-
-            if let Some(index) = navigate_to {
-                self.selected = Some(index);
-                if let (Some(start), Some(player)) =
-                    (self.project.lyrics[index].start_ms, &mut self.player)
-                {
-                    let _ = player.seek(start);
-                }
-            }
-
-            if selected.is_some() && !ctx.wants_keyboard_input() {
-                let keyboard_delta = ctx.input(|input| {
-                    if !input.modifiers.ctrl {
-                        None
-                    } else if input.key_pressed(egui::Key::ArrowLeft) {
-                        Some(if input.modifiers.shift { -100 } else { -10 })
-                    } else if input.key_pressed(egui::Key::ArrowRight) {
-                        Some(if input.modifiers.shift { 100 } else { 10 })
-                    } else {
-                        None
-                    }
-                });
-                shift_by = shift_by.or(keyboard_delta);
-            }
-            if let Some(index) = selected {
-                if let Some(reading) = reading_edit {
-                    let line = &mut self.project.lyrics[index];
-                    line.reading_text = reading;
-                    line.reading_source = line.reading_text.as_ref().map(|_| ReadingSource::Manual);
-                    edited = true;
-                }
-                if let Some(ms) = set_to {
-                    lyric_editor::set_line_start(&mut self.project.lyrics, index, ms);
-                    edited = true;
-                }
-                if let Some(delta) = shift_by {
-                    lyric_editor::shift_line_start(
-                        &mut self.project.lyrics,
-                        index,
-                        delta,
-                        duration,
-                    );
-                    edited = true;
-                }
-                if clear_time {
-                    let line = &mut self.project.lyrics[index];
-                    line.start_ms = None;
-                    line.end_ms = None;
-                    line.confidence = None;
-                    line.timestamp_source = None;
-                    edited = true;
-                }
-                if seek_selected {
-                    if let (Some(ms), Some(player)) =
-                        (self.project.lyrics[index].start_ms, &mut self.player)
-                    {
-                        if let Err(error) = player.seek(ms) {
-                            self.status = error;
-                        }
-                    }
-                }
-            }
-            if edited {
-                self.changed();
-                self.sync_lyric_inputs_from_project();
-            }
-            ui.horizontal(|ui| {
-                if self.job.is_some() {
-                    if ui.button("同期をキャンセル").clicked() {
-                        if let Some(job) = &self.job {
-                            job.cancel();
-                            self.generation = self.generation.wrapping_add(1);
-                        }
-                    }
-                } else if ui
-                    .add_enabled(
-                        !self.project.audio_path.as_os_str().is_empty()
-                            && !self.project.lyrics.is_empty(),
-                        egui::Button::new("自動同期"),
-                    )
-                    .clicked()
-                {
-                    let language = crate::forced_alignment::tokenizer::resolve_language(
-                        &self.language,
-                        &self.project.lyrics,
-                    );
-                    let Ok(language) = language else {
-                        self.status = language.unwrap_err();
-                        return;
-                    };
-                    let japanese = language
-                        == crate::forced_alignment::tokenizer::AlignmentLanguage::Japanese;
-                    let settings = ToolSettings {
-                        ffmpeg: self.ffmpeg.clone().into(),
-                        model: if japanese {
-                            self.japanese_model.clone().into()
-                        } else {
-                            self.model.clone().into()
-                        },
-                        vocabulary: japanese.then(|| self.japanese_vocabulary.clone().into()),
-                        language: language.code().into(),
-                        threads: self.alignment_threads,
-                    };
-                    match settings.validate_model(&self.project.lyrics) {
-                        Err(error) => self.status = error,
-                        Ok(()) => {
-                            self.job_generation = self.generation;
-                            self.job = Some(Job::start(
-                                self.project.audio_path.clone(),
-                                self.project.lyrics.clone(),
-                                settings,
-                            ));
-                            self.job_started_at = Some(Instant::now());
-                        }
-                    }
-                }
-            });
                 });
         });
     }

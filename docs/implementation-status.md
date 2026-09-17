@@ -23,12 +23,13 @@
 | T19 | 実装済み | Auto/en/jp言語切替、日本語文字検出、外部tokenizer語彙、日本語Wav2Vec2 Forced Alignment。 |
 | T20 | 実装済み | 常設メニューバーと保存ショートカット、原文・カタカナ2トラックのドラッグ編集タイムライン、Ctrl+ホイール拡大縮小。 |
 | T21 | 実装済み | 左ペインを音声・原文・カタカナ入力へ変更し、中央一覧を現在行に集中した可変ms時刻補正UIへ変更。 |
+| T22 | 実装済み | タイムラインの左右端ドラッグによる開始・終了個別調整、再生位置追従、右クリックでの追従移動トグルなど編集UXの改善。歌詞テキストの空行破棄。音声タグ書込みをメニューの`MP3 + LRC`/`FLAC`/`M4A`サブメニューへ再編し、FLAC/M4Aへの同期歌詞埋め込み（`ItemKey::Lyrics`）とMP3の`.lrc`併用出力を追加。可逆音源（WAV/FLAC）読み込み時はffmpeg経由で他形式へ変換してから書き込む機能も追加（非可逆音源からの変換は二重圧縮を避けるため提供しない）。 |
 
 ## 検証環境
 
 Windows のローカル検証は Rust GNU クロスビルドで実施しました。GNUビルドではONNX Runtime 1.25.1をDLLとして動的ロードします。通常の開発環境には Rust の MSVC ツールチェーンと Visual Studio Build Tools（Windows SDK を含む）を推奨します。
 
-- Windows向け `cargo test`: 32件成功。
+- Windows向け `cargo test`: 36件成功。
 - Windows向け `cargo clippy --all-targets -- -D warnings`: 成功。
 - `cargo fmt --all -- --check`: 成功。
 - GUI実行ファイルを起動し、ウィンドウ生成と起動時エラーがないことを確認。

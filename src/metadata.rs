@@ -6,7 +6,7 @@ use std::{
 
 use lofty::{
     config::WriteOptions,
-    file::{AudioFile, TaggedFileExt},
+    file::{AudioFile, FileType, TaggedFileExt},
     picture::{Picture, PictureType},
     tag::{Accessor, ItemKey, Tag},
 };
@@ -68,9 +68,11 @@ pub fn write(
     title: &str,
     artist: &str,
     metadata: &MusicMetadata,
+    lyrics: Option<&str>,
 ) -> Result<PathBuf, String> {
     let mut tagged = lofty::read_from_path(path)
         .map_err(|error| format!("音楽情報を読み込めません: {error}"))?;
+    let file_type = tagged.file_type();
     let tag_type = tagged.primary_tag_type();
     if tagged.primary_tag().is_none() {
         tagged.insert_tag(Tag::new(tag_type));
@@ -84,6 +86,17 @@ pub fn write(
     set_item(tag, ItemKey::AlbumTitle, &metadata.album);
     set_item(tag, ItemKey::Genre, &metadata.genre);
     set_item(tag, ItemKey::AlbumArtist, &metadata.album_artist);
+    // `ItemKey::Lyrics` maps to a real tag field for Vorbis Comments (FLAC)
+    // and the MP4 `©lyr` atom, both of which happily hold LRC-formatted
+    // text. ID3v2 (MP3) has no such generic field — synced lyrics there
+    // need a dedicated SYLT frame, which isn't written here — so this is
+    // skipped for MP3 and it keeps relying on a companion .lrc file.
+    if matches!(file_type, FileType::Flac | FileType::Mp4) {
+        match lyrics {
+            Some(text) if !text.trim().is_empty() => set_item(tag, ItemKey::Lyrics, text),
+            _ => tag.remove_key(ItemKey::Lyrics),
+        }
+    }
     if let Some(year) = metadata.year.and_then(|year| u16::try_from(year).ok()) {
         tag.set_date(lofty::tag::items::Timestamp {
             year,
