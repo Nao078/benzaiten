@@ -23,19 +23,16 @@ fn line(id: usize, text: &str, start_ms: Option<u64>) -> LyricLine {
 }
 
 #[test]
-fn lyrics_parser_preserves_blank_and_trailing_rows() {
-    let lines = parse_lyrics("\u{feff}first\r\n\nlast\n");
+fn lyrics_parser_drops_blank_rows() {
+    let lines = parse_lyrics("\u{feff}first\r\n\n   \nlast\n");
     assert_eq!(
         lines
             .iter()
             .map(|line| line.original_text.as_str())
             .collect::<Vec<_>>(),
-        ["first", "", "last", ""]
+        ["first", "last"]
     );
-    assert_eq!(
-        lines.iter().map(|line| line.id).collect::<Vec<_>>(),
-        [0, 1, 2, 3]
-    );
+    assert_eq!(lines.iter().map(|line| line.id).collect::<Vec<_>>(), [0, 1]);
 }
 
 #[test]

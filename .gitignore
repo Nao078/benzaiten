@@ -6,3 +6,4 @@ model
 /ffmpeg/
 /models/*.onnx
 /models/*.json
+/runtime/*.dll

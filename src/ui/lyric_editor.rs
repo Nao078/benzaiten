@@ -9,6 +9,14 @@ pub fn set_start(line: &mut LyricLine, ms: u64) {
     line.confidence = None;
 }
 
+/// Set a line's end time explicitly, e.g. from dragging the timeline block's
+/// right-edge handle.
+pub fn set_end(line: &mut LyricLine, ms: u64) {
+    line.end_ms = Some(ms);
+    line.timestamp_source = Some(TimestampSource::Manual);
+    line.confidence = None;
+}
+
 pub fn shift_start(line: &mut LyricLine, delta: i64, duration: Option<u64>) {
     if let Some(ms) = line.start_ms {
         let shifted = ms.saturating_add_signed(delta);
@@ -16,18 +24,16 @@ pub fn shift_start(line: &mut LyricLine, delta: i64, duration: Option<u64>) {
     }
 }
 
-/// Set one line's start and keep an explicit previous-line end consistent.
+/// Set one line's start, identified by index within a slice.
+///
+/// This only touches the targeted line. Earlier lines keep whatever end time
+/// they already had, even if that now leaves a gap or overlap next to this
+/// line — moving one line's boundary should not silently reshape its
+/// neighbor's.
 pub fn set_line_start(lines: &mut [LyricLine], index: usize, ms: u64) {
-    if index >= lines.len() {
-        return;
+    if let Some(line) = lines.get_mut(index) {
+        set_start(line, ms);
     }
-    if index > 0 && lines[index - 1].end_ms.is_some() {
-        lines[index - 1].end_ms = lines[index - 1]
-            .start_ms
-            .filter(|start| *start <= ms)
-            .map(|_| ms);
-    }
-    set_start(&mut lines[index], ms);
 }
 
 pub fn shift_line_start(lines: &mut [LyricLine], index: usize, delta: i64, duration: Option<u64>) {
@@ -45,7 +51,9 @@ pub fn shift_line_start(lines: &mut [LyricLine], index: usize, delta: i64, durat
 /// Shift every timestamp from `index` by the same effective delta.
 ///
 /// The delta is reduced when necessary so no timestamp crosses zero or the
-/// audio duration. Keeping a common delta preserves spacing between lines.
+/// audio duration. Keeping a common delta preserves spacing between lines in
+/// `index..`. The line before `index` is left untouched, same as
+/// `set_line_start`.
 pub fn shift_from(
     lines: &mut [LyricLine],
     index: usize,
@@ -83,12 +91,6 @@ pub fn shift_from(
             line.timestamp_source = Some(TimestampSource::Manual);
             line.confidence = None;
         }
-    }
-    if index > 0 && lines[index - 1].end_ms.is_some() {
-        let shifted_start = lines[index].start_ms;
-        let previous_start = lines[index - 1].start_ms;
-        lines[index - 1].end_ms =
-            shifted_start.filter(|start| previous_start.is_some_and(|previous| previous <= *start));
     }
     delta
 }

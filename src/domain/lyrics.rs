@@ -1,18 +1,23 @@
 pub use super::project::{LyricLine, ReadingSource, TimestampSource};
 
-/// Parses the editable lyric text without changing its line boundaries.
+/// Parses the editable lyric text into lyric lines.
 ///
 /// A UTF-8 BOM is tolerated at the very beginning of the input and CRLF input
-/// is represented with the same text as LF input.
+/// is represented with the same text as LF input. Blank rows (used only for
+/// readability while pasting or editing, e.g. stanza breaks) are dropped
+/// rather than becoming empty lyric lines, so every remaining line is a real
+/// alignment target and ids stay compact (0, 1, 2, ...).
 pub fn parse_lyrics(input: &str) -> Vec<LyricLine> {
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
 
     input
         .split('\n')
+        .map(|row| row.strip_suffix('\r').unwrap_or(row).to_owned())
+        .filter(|row| !row.trim().is_empty())
         .enumerate()
-        .map(|(id, row)| LyricLine {
+        .map(|(id, original_text)| LyricLine {
             id,
-            original_text: row.strip_suffix('\r').unwrap_or(row).to_owned(),
+            original_text,
             reading_text: None,
             reading_source: None,
             start_ms: None,
@@ -84,11 +89,46 @@ fn set_reading(line: &mut LyricLine, reading: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_readings, parse_lyrics, ReadingSource};
+    use super::{apply_readings, parse_lyrics, LyricLine, ReadingSource};
+
+    /// Builds lyric lines directly (bypassing `parse_lyrics`, which drops
+    /// blank rows) so blank-row handling in `apply_readings` stays covered.
+    fn lines(rows: &[&str]) -> Vec<LyricLine> {
+        rows.iter()
+            .enumerate()
+            .map(|(id, text)| LyricLine {
+                id,
+                original_text: (*text).to_owned(),
+                reading_text: None,
+                reading_source: None,
+                start_ms: None,
+                end_ms: None,
+                confidence: None,
+                timestamp_source: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_lyrics_drops_blank_rows() {
+        let lyrics = parse_lyrics("\u{feff}first\r\n\n   \nlast\n");
+
+        assert_eq!(
+            lyrics
+                .iter()
+                .map(|line| line.original_text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "last"]
+        );
+        assert_eq!(
+            lyrics.iter().map(|line| line.id).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
 
     #[test]
     fn applies_readings_with_matching_blank_rows() {
-        let mut lyrics = parse_lyrics("Hello\n\nWorld\n");
+        let mut lyrics = lines(&["Hello", "", "World"]);
         let count = apply_readings(&mut lyrics, "ハロー\n\nワールド").unwrap();
 
         assert_eq!(count, 2);
@@ -100,7 +140,7 @@ mod tests {
 
     #[test]
     fn allows_omitting_blank_stanza_rows() {
-        let mut lyrics = parse_lyrics("Hello\n\nWorld");
+        let mut lyrics = lines(&["Hello", "", "World"]);
         apply_readings(&mut lyrics, "ハロー\nワールド").unwrap();
 
         assert_eq!(lyrics[0].reading_text.as_deref(), Some("ハロー"));

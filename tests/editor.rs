@@ -22,18 +22,18 @@ fn correction_clears_stale_confidence_and_invalid_end() {
 }
 
 #[test]
-fn line_correction_keeps_previous_end_consistent() {
+fn changing_a_line_start_does_not_touch_the_previous_line() {
     let mut lines = parse_lyrics("one\ntwo");
     lines[0].start_ms = Some(100);
     lines[0].end_ms = Some(500);
     lines[1].start_ms = Some(500);
 
     set_line_start(&mut lines, 1, 650);
-    assert_eq!(lines[0].end_ms, Some(650));
+    assert_eq!(lines[0].end_ms, Some(500));
     assert_eq!(lines[1].start_ms, Some(650));
 
     shift_line_start(&mut lines, 1, -50, Some(1_000));
-    assert_eq!(lines[0].end_ms, Some(600));
+    assert_eq!(lines[0].end_ms, Some(500));
     assert_eq!(lines[1].start_ms, Some(600));
 }
 
@@ -48,6 +48,7 @@ fn bulk_shift_preserves_spacing_and_clamps_as_one_group() {
 
     assert_eq!(shift_from(&mut lines, 1, 500, Some(1_000)), 100);
     assert_eq!(lines[0].start_ms, Some(100));
+    assert_eq!(lines[0].end_ms, Some(200));
     assert_eq!(lines[1].start_ms, Some(500));
     assert_eq!(lines[2].start_ms, Some(900));
     assert_eq!(lines[2].end_ms, Some(1_000));

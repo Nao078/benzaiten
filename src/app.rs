@@ -11,7 +11,7 @@ use crate::{
     ui::{
         lyric_editor,
         player::format_time,
-        timeline::{self, DragAnchor, TimelineAction},
+        timeline::{self, DragAnchor, ResizeAnchor, ResizeEdge, TimelineAction},
     },
 };
 
@@ -140,6 +140,8 @@ pub struct BenzaitenApp {
     show_external_tools: bool,
     timeline_zoom: f32,
     timeline_drag: Option<DragAnchor>,
+    timeline_resize: Option<ResizeAnchor>,
+    timeline_link_tail_movement: bool,
     original_lyrics_input: String,
     reading_lyrics_input: String,
 }
@@ -210,6 +212,8 @@ impl BenzaitenApp {
             show_external_tools: false,
             timeline_zoom: 80.0,
             timeline_drag: None,
+            timeline_resize: None,
+            timeline_link_tail_movement: false,
             original_lyrics_input: String::new(),
             reading_lyrics_input: String::new(),
         }
@@ -476,20 +480,112 @@ impl BenzaitenApp {
                 TimelineAction::Drag { index, delta_ms } => {
                     if let Some(anchor) = self.timeline_drag.filter(|anchor| anchor.index == index)
                     {
-                        let start = anchor.start_ms.saturating_add_signed(delta_ms);
-                        lyric_editor::move_line_to(
-                            &mut self.project.lyrics,
-                            index,
-                            start,
-                            anchor.length_ms,
-                            duration,
-                        );
+                        if self.timeline_link_tail_movement {
+                            // `delta_ms` is already this frame's incremental
+                            // pointer movement, so applying it directly to
+                            // the group's current (already-shifted) start
+                            // times accumulates correctly frame over frame,
+                            // no anchor bookkeeping needed here.
+                            lyric_editor::shift_from(
+                                &mut self.project.lyrics,
+                                index,
+                                delta_ms,
+                                duration,
+                            );
+                        } else {
+                            let start = anchor.start_ms.saturating_add_signed(delta_ms);
+                            lyric_editor::move_line_to(
+                                &mut self.project.lyrics,
+                                index,
+                                start,
+                                anchor.length_ms,
+                                duration,
+                            );
+                            // `delta_ms` is the pointer movement since the
+                            // previous frame (egui's `drag_delta`), not since
+                            // the drag started. Roll it into the anchor so
+                            // the next frame's delta keeps building on the
+                            // new position instead of snapping back toward
+                            // the drag's starting point.
+                            self.timeline_drag = Some(DragAnchor {
+                                index,
+                                start_ms: start,
+                                length_ms: anchor.length_ms,
+                            });
+                        }
                         self.changed();
                     }
                 }
                 TimelineAction::EndDrag => {
                     self.timeline_drag = None;
                     self.status = "タイムライン上の歌詞時刻を変更しました".into();
+                }
+                TimelineAction::SetLinkedTailMovement(enabled) => {
+                    self.timeline_link_tail_movement = enabled;
+                }
+                TimelineAction::BeginResize { index, edge } => {
+                    if let Some(line) = self.project.lyrics.get(index) {
+                        let ms = match edge {
+                            ResizeEdge::Start => line.start_ms,
+                            ResizeEdge::End => line
+                                .end_ms
+                                .or_else(|| {
+                                    self.project.lyrics[index + 1..]
+                                        .iter()
+                                        .find_map(|following| following.start_ms)
+                                })
+                                .or_else(|| line.start_ms.map(|start| start.saturating_add(2_000))),
+                        };
+                        if let Some(ms) = ms {
+                            self.selected = Some(index);
+                            self.timeline_resize = Some(ResizeAnchor { index, edge, ms });
+                        }
+                    }
+                }
+                TimelineAction::Resize {
+                    index,
+                    edge,
+                    delta_ms,
+                } => {
+                    const MIN_LENGTH_MS: u64 = 50;
+                    if let Some(anchor) = self
+                        .timeline_resize
+                        .filter(|anchor| anchor.index == index && anchor.edge == edge)
+                    {
+                        let requested = anchor.ms.saturating_add_signed(delta_ms);
+                        // Keep at least MIN_LENGTH_MS between start and end so a
+                        // fast drag can't push one handle past the other.
+                        let applied = self.project.lyrics.get_mut(index).map(|line| match edge {
+                            ResizeEdge::Start => {
+                                let max_start = line
+                                    .end_ms
+                                    .map_or(u64::MAX, |end| end.saturating_sub(MIN_LENGTH_MS));
+                                let start = requested.min(max_start);
+                                lyric_editor::set_start(line, start);
+                                start
+                            }
+                            ResizeEdge::End => {
+                                let min_end = line
+                                    .start_ms
+                                    .map_or(0, |start| start.saturating_add(MIN_LENGTH_MS));
+                                let end = requested.max(min_end).min(duration.unwrap_or(u64::MAX));
+                                lyric_editor::set_end(line, end);
+                                end
+                            }
+                        });
+                        if let Some(applied) = applied {
+                            self.timeline_resize = Some(ResizeAnchor {
+                                index,
+                                edge,
+                                ms: applied,
+                            });
+                            self.changed();
+                        }
+                    }
+                }
+                TimelineAction::EndResize => {
+                    self.timeline_resize = None;
+                    self.status = "タイムライン上で開始・終了時刻を調整しました".into();
                 }
             }
         }
@@ -932,16 +1028,40 @@ impl eframe::App for BenzaitenApp {
                     if ui.small_button("＋").clicked() {
                         self.timeline_zoom = (self.timeline_zoom * 1.25).min(timeline::MAX_ZOOM);
                     }
-                    ui.label("Ctrl+ホイールで拡大縮小 / ブロックをドラッグして移動");
+                    ui.separator();
+                    let current_position = self.player.as_ref().map(AudioPlayer::position_ms);
+                    if ui
+                        .add_enabled(
+                            self.selected.is_some() && current_position.is_some(),
+                            egui::Button::new("現在の再生位置を開始時刻に設定"),
+                        )
+                        .clicked()
+                    {
+                        if let (Some(index), Some(position)) = (self.selected, current_position) {
+                            lyric_editor::set_line_start(&mut self.project.lyrics, index, position);
+                            self.changed();
+                            self.status = "現在の再生位置を開始時刻に設定しました".into();
+                        }
+                    }
+                    ui.label(
+                        "Ctrl+ホイールで拡大縮小 / ドラッグで移動 / 端をドラッグして開始・終了を調整 / 右クリックで追従移動の設定",
+                    );
                 });
                 timeline_actions = timeline::show(
                     ui,
                     &self.project.lyrics,
-                    timeline_position,
-                    timeline_duration,
+                    timeline::PlaybackState {
+                        position_ms: timeline_position,
+                        duration_ms: timeline_duration,
+                        is_playing: self.player.as_ref().is_some_and(AudioPlayer::is_playing),
+                    },
                     self.selected,
                     &mut self.timeline_zoom,
-                    self.timeline_drag,
+                    timeline::InteractionState {
+                        drag_anchor: self.timeline_drag,
+                        resize_anchor: self.timeline_resize,
+                        linked_tail_movement: self.timeline_link_tail_movement,
+                    },
                 );
             });
         self.handle_timeline_actions(timeline_actions, timeline_duration);
@@ -965,24 +1085,38 @@ impl eframe::App for BenzaitenApp {
                 ui.separator();
                 ui.strong("原文歌詞");
                 ui.small("Forced Alignmentで使用する正解歌詞を入力します");
-                original_input_changed = ui
-                    .add(
-                        egui::TextEdit::multiline(&mut self.original_lyrics_input)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(14)
-                            .hint_text("歌詞を1行ずつ入力してください"),
-                    )
+                // Fix the box's height and scroll long lyrics inside it,
+                // instead of letting the TextEdit grow and push the katakana
+                // box (and everything below it) out of view.
+                let original_area_height = ui.available_height() * 0.55;
+                original_input_changed = egui::ScrollArea::vertical()
+                    .id_salt("original-lyrics-scroll")
+                    .max_height(original_area_height)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.original_lyrics_input)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(14)
+                                .hint_text("歌詞を1行ずつ入力してください"),
+                        )
+                    })
+                    .inner
                     .changed();
                 ui.separator();
                 ui.strong("カタカナ歌詞（任意）");
                 ui.small("同期判定には使用されません");
-                reading_input_changed = ui
-                    .add(
-                        egui::TextEdit::multiline(&mut self.reading_lyrics_input)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(10)
-                            .hint_text("原文と同じ行構成で入力してください"),
-                    )
+                reading_input_changed = egui::ScrollArea::vertical()
+                    .id_salt("reading-lyrics-scroll")
+                    .max_height(ui.available_height())
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.reading_lyrics_input)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(10)
+                                .hint_text("原文と同じ行構成で入力してください"),
+                        )
+                    })
+                    .inner
                     .changed();
             });
         if original_input_changed {
@@ -1015,66 +1149,8 @@ impl eframe::App for BenzaitenApp {
                     &self.project.title
                 });
                 ui.label(&self.project.artist);
-                if let Some(player) = &mut self.player {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(if player.is_playing() {
-                                "一時停止"
-                            } else {
-                                "▶ 再生"
-                            })
-                            .clicked()
-                        {
-                            if player.is_playing() {
-                                player.pause();
-                            } else if let Err(error) = player.play() {
-                                self.status = error;
-                            }
-                        }
-                        let mut position = player.position_ms();
-                        ui.label(format_time(position));
-                        if let Some(duration) = player.duration_ms() {
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut position, 0..=duration)
-                                        .show_value(false),
-                                )
-                                .changed()
-                            {
-                                let _ = player.seek(position);
-                            }
-                            ui.label(format_time(duration));
-                        }
-                    });
-                } else {
-                    ui.label("音声を読み込んでください");
-                }
                 ui.checkbox(&mut self.auto_scroll, "歌詞を自動スクロール");
                 ui.separator();
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.vertical_centered(|ui| {
-                        ui.small("現在の歌詞");
-                        if let Some(index) = active_index {
-                            let line = &self.project.lyrics[index];
-                            ui.label(
-                                egui::RichText::new(&line.original_text)
-                                    .size(20.0)
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            );
-                            if let Some(reading) = &line.reading_text {
-                                ui.label(
-                                    egui::RichText::new(reading)
-                                        .size(16.0)
-                                        .color(egui::Color32::LIGHT_BLUE),
-                                );
-                            }
-                        } else {
-                            ui.label("—");
-                        }
-                    });
-                });
                 ui.heading("Lyrics");
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (index, line) in self.project.lyrics.iter().enumerate() {
@@ -1118,6 +1194,54 @@ impl eframe::App for BenzaitenApp {
             });
         self.last_highlighted = active_index;
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Reserve the playback bar's space at the bottom of the central
+            // area first so its position stays fixed no matter how tall the
+            // scrollable content above it grows (e.g. a long lyric line).
+            egui::TopBottomPanel::bottom("central-playback-bar")
+                .show_separator_line(false)
+                .show_inside(ui, |ui| {
+                    ui.separator();
+                    if let Some(player) = &mut self.player {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(if player.is_playing() {
+                                    "一時停止"
+                                } else {
+                                    "▶ 再生"
+                                })
+                                .clicked()
+                            {
+                                if player.is_playing() {
+                                    player.pause();
+                                } else if let Err(error) = player.play() {
+                                    self.status = error;
+                                }
+                            }
+                            let mut position = player.position_ms();
+                            ui.label(format_time(position));
+                            if let Some(duration) = player.duration_ms() {
+                                ui.spacing_mut().slider_width =
+                                    (ui.available_width() - 60.0).max(80.0);
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut position, 0..=duration)
+                                            .show_value(false),
+                                    )
+                                    .changed()
+                                {
+                                    let _ = player.seek(position);
+                                }
+                                ui.label(format_time(duration));
+                            }
+                        });
+                    } else {
+                        ui.label("音声を読み込んでください");
+                    }
+                });
+            egui::ScrollArea::vertical()
+                .id_salt("central-content-scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
             ui.heading(if self.dirty {
                 "弁才天 *"
             } else {
@@ -1251,7 +1375,6 @@ impl eframe::App for BenzaitenApp {
                 .filter(|index| *index < self.project.lyrics.len());
             let mut set_to = None;
             let mut shift_by = None;
-            let mut shift_tail_by = None;
             let mut clear_time = false;
             let mut seek_selected = false;
             let mut navigate_to = None;
@@ -1348,26 +1471,8 @@ impl eframe::App for BenzaitenApp {
                         if ui.button("この行から再生").clicked() {
                             seek_selected = true;
                         }
-                        if ui
-                            .add_enabled(
-                                position.is_some(),
-                                egui::Button::new("現在の再生位置を開始時刻に設定"),
-                            )
-                            .clicked()
-                        {
-                            set_to = position;
-                        }
                         if ui.button("時刻を解除").clicked() {
                             clear_time = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("この行以降を同じ幅で");
-                        if ui.button("前へ移動").clicked() {
-                            shift_tail_by = Some(-self.bulk_shift_ms);
-                        }
-                        if ui.button("後ろへ移動").clicked() {
-                            shift_tail_by = Some(self.bulk_shift_ms);
                         }
                     });
                     let score = line
@@ -1430,19 +1535,6 @@ impl eframe::App for BenzaitenApp {
                         duration,
                     );
                     edited = true;
-                }
-                if let Some(delta) = shift_tail_by {
-                    let applied = lyric_editor::shift_from(
-                        &mut self.project.lyrics,
-                        index,
-                        delta,
-                        duration,
-                    );
-                    if applied != 0 {
-                        self.status =
-                            format!("行 {} 以降を {applied:+} ms 移動しました", index + 1);
-                        edited = true;
-                    }
                 }
                 if clear_time {
                     let line = &mut self.project.lyrics[index];
@@ -1517,6 +1609,7 @@ impl eframe::App for BenzaitenApp {
                     }
                 }
             });
+                });
         });
     }
 }
