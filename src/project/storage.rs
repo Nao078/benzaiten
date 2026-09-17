@@ -1,3 +1,5 @@
+//! プロジェクトJSONのアトミックな保存・読込、スキーマ移行、内容検証。
+
 use std::{collections::HashSet, fs, io::Write, path::Path};
 
 use serde::Deserialize;
@@ -7,8 +9,9 @@ use crate::domain::project::{
     LyricLine, MusicMetadata, Project, TimestampSource, CURRENT_SCHEMA_VERSION,
 };
 
-/// Stores a project as JSON. The temporary file is created beside the target,
-/// so replacing it does not cross filesystems.
+/// プロジェクトをJSONとして保存する。一時ファイルは保存先と同じ
+/// ディレクトリに作成するため、リネームによる置き換えがファイル
+/// システムをまたがずに済む（アトミックな書き込みになる）。
 pub fn save(path: &Path, project: &Project) -> Result<(), String> {
     validate(project)?;
 
@@ -40,9 +43,10 @@ pub fn save(path: &Path, project: &Project) -> Result<(), String> {
     replace_file(temporary, path)
 }
 
-/// Loads a project and resolves a relative audio path from the project file's
-/// directory. The audio file itself is deliberately not required to exist,
-/// because a project may be moved before the audio is relinked.
+/// プロジェクトを読み込み、相対音声パスをプロジェクトファイルのある
+/// ディレクトリから解決する。音声ファイル自体の存在はあえて必須と
+/// しない。プロジェクトが移動された後、音声を再リンクする前でも
+/// 開けるようにするためである。
 pub fn load(path: &Path) -> Result<Project, String> {
     let contents = fs::read(path)
         .map_err(|error| format!("could not read project file {}: {error}", path.display()))?;
@@ -52,6 +56,8 @@ pub fn load(path: &Path) -> Result<Project, String> {
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| format!("project file {} has no schema version", path.display()))?;
+    // スキーマバージョンごとに、まず旧バージョンの構造体としてパースして
+    // から現行の`Project`へ移行する。現行バージョンはそのまま直接パースする。
     let mut project = match schema_version {
         1 => migrate_v1(serde_json::from_value(document).map_err(|error| {
             format!(
@@ -60,6 +66,8 @@ pub fn load(path: &Path) -> Result<Project, String> {
             )
         })?),
         2 => {
+            // v2はv3（本メタデータ追加）とフィールド互換なので、
+            // パース自体はそのまま行い、バージョン番号だけ更新する。
             let mut project: Project = serde_json::from_value(document).map_err(|error| {
                 format!(
                     "could not parse v2 project file {}: {error}",
@@ -92,6 +100,7 @@ pub fn load(path: &Path) -> Result<Project, String> {
                 .join(parent)
         };
         project.audio_path = parent.join(&project.audio_path);
+        // アートワークパスも音声パスと同じ規則で相対解決する。
         if project
             .metadata
             .artwork_path
@@ -108,6 +117,10 @@ pub fn load(path: &Path) -> Result<Project, String> {
     Ok(project)
 }
 
+/// プロジェクトの整合性を検証する：現行スキーマバージョンであること、
+/// 行idの重複がないこと、`end_ms`が`start_ms`より前でないこと、
+/// confidenceが有効な範囲(0.0〜1.0)であること、原文・読みに改行が
+/// 含まれていないこと（LRC出力を壊さないようにするための制約）。
 fn validate(project: &Project) -> Result<(), String> {
     if project.schema_version != CURRENT_SCHEMA_VERSION {
         return Err(format!(
@@ -145,6 +158,8 @@ fn validate(project: &Project) -> Result<(), String> {
     Ok(())
 }
 
+/// 旧Whisperパイプライン時代（schema v1）のプロジェクト構造。
+/// `text`/`source`が現行の`original_text`/`timestamp_source`に対応する。
 #[derive(Deserialize)]
 struct ProjectV1 {
     title: String,
@@ -163,6 +178,8 @@ struct LyricLineV1 {
     source: Option<TimestampSourceV1>,
 }
 
+/// v1時代の`TimestampSource`。`Auto`は現行の`LegacyAuto`に対応する
+/// （当時は現在のForced Alignmentではなく、Whisperによる自動認識だったため）。
 #[derive(Deserialize)]
 enum TimestampSourceV1 {
     Auto,
@@ -170,6 +187,8 @@ enum TimestampSourceV1 {
     Interpolated,
 }
 
+/// v1プロジェクトを現行の`Project`へ移行する。カタカナ読み関連の
+/// フィールド（v1には存在しない）は`None`で初期化する。
 fn migrate_v1(project: ProjectV1) -> Project {
     Project {
         schema_version: CURRENT_SCHEMA_VERSION,
@@ -198,6 +217,7 @@ fn migrate_v1(project: ProjectV1) -> Project {
     }
 }
 
+/// 一時ファイルを`destination`へ配置（リネーム）する。
 fn replace_file(temporary: NamedTempFile, destination: &Path) -> Result<(), String> {
     temporary.persist(destination).map(|_| ()).map_err(|error| {
         format!(

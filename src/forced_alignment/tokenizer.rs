@@ -1,10 +1,17 @@
+//! 歌詞テキストを、音響モデルの語彙に対応したトークンID列（transcript）へ
+//! 変換する処理。英語はモデルに焼き込まれた固定語彙を、日本語は外部の
+//! tokenizer.jsonから読み込んだ語彙を使う。
+
 use crate::domain::lyrics::LyricLine;
 use std::{collections::HashMap, path::Path};
 use unicode_normalization::UnicodeNormalization;
 
+/// CTCのblank（空白）トークンID。英語モデル・日本語モデルとも通常は0。
 pub const BLANK_ID: usize = 0;
+/// `facebook/wav2vec2-base-960h`の語彙における単語区切り（`|`）トークンID。
 pub const WORD_DELIMITER_ID: usize = 4;
 
+/// Forced Alignmentに使う言語。GUIの`Auto/en/jp`選択に対応する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlignmentLanguage {
     English,
@@ -20,13 +27,20 @@ impl AlignmentLanguage {
     }
 }
 
+/// トークン化された歌詞全体。`token_ids[i]`がどの歌詞行に属するかを
+/// `line_indices[i]`が示し、[`resolver`](super::resolver)がこれを使って
+/// トークンごとのアラインメント結果を行単位に集約する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcript {
     pub token_ids: Vec<usize>,
     pub line_indices: Vec<usize>,
+    /// 単語区切りトークンのID（あれば）。`resolver`はこのIDのトークンを
+    /// 実際の歌詞内容ではなく区切りとして扱い、行の時刻集計から除外する。
     pub delimiter_id: Option<usize>,
 }
 
+/// 日本語Forced Alignment用の、外部ファイルから読み込んだ文字→トークンID
+/// の対応表。
 #[derive(Debug, Clone)]
 pub struct Vocabulary {
     tokens: HashMap<char, usize>,
@@ -35,7 +49,11 @@ pub struct Vocabulary {
 }
 
 impl Vocabulary {
-    /// Load either Hugging Face `vocab.json` or `tokenizer.json`.
+    /// Hugging Faceの`vocab.json`または`tokenizer.json`のどちらの形式も
+    /// 読み込む。`tokenizer.json`は`model.vocab`、`vocab.json`は
+    /// トップレベルの`vocab`（または直下）に語彙マップを持つため、
+    /// その両方を順に探す。1文字のトークンだけを文字→IDの対応として
+    /// 採用する（サブワード等の複数文字トークンは無視する）。
     pub fn load(path: &Path) -> Result<Self, String> {
         let bytes = std::fs::read(path)
             .map_err(|error| format!("could not read vocabulary {}: {error}", path.display()))?;
@@ -77,6 +95,8 @@ impl Vocabulary {
     }
 }
 
+/// GUI/CLIの言語モード文字列（`auto`/`en`/`jp`/`ja`）を[`AlignmentLanguage`]
+/// へ解決する。`auto`の場合は歌詞の文字種から自動判定する。
 pub fn resolve_language(mode: &str, lyrics: &[LyricLine]) -> Result<AlignmentLanguage, String> {
     match mode.to_ascii_lowercase().as_str() {
         "auto" => Ok(detect_language(lyrics)),
@@ -88,6 +108,8 @@ pub fn resolve_language(mode: &str, lyrics: &[LyricLine]) -> Result<AlignmentLan
     }
 }
 
+/// 歌詞にひらがな・カタカナ・漢字が1文字でも含まれていれば日本語、
+/// それ以外は英語と判定する。
 pub fn detect_language(lyrics: &[LyricLine]) -> AlignmentLanguage {
     if lyrics
         .iter()
@@ -100,6 +122,7 @@ pub fn detect_language(lyrics: &[LyricLine]) -> AlignmentLanguage {
     }
 }
 
+/// 英語モデル（`facebook/wav2vec2-base-960h`）の固定語彙で歌詞をトークン化する。
 pub fn tokenize_english(lyrics: &[LyricLine]) -> Result<Transcript, String> {
     tokenize_with(
         lyrics,
@@ -110,11 +133,15 @@ pub fn tokenize_english(lyrics: &[LyricLine]) -> Result<Transcript, String> {
     )
 }
 
-/// Backward-compatible English tokenizer entry point.
+/// 後方互換のための、英語トークナイザへのエイリアス。
 pub fn tokenize(lyrics: &[LyricLine]) -> Result<Transcript, String> {
     tokenize_english(lyrics)
 }
 
+/// 日本語モデル用に、外部から読み込んだ[`Vocabulary`]で歌詞をトークン化
+/// する。トークン化後、語彙に無いアライメント対象文字（ひらがな・カタカナ・
+/// 漢字やASCII英数字など）が残っていれば、モデルが扱えない文字として
+/// エラーにする（珍しい漢字などをユーザーに気付かせるため）。
 pub fn tokenize_japanese(
     lyrics: &[LyricLine],
     vocabulary: &Vocabulary,
@@ -148,6 +175,15 @@ pub fn tokenize_japanese(
     Ok(transcript)
 }
 
+/// 英語・日本語共通のトークン化処理本体。行ごとにテキストを正規化し、
+/// 語彙に存在する文字だけをトークンへ変換する（語彙にない文字は単に
+/// スキップする。日本語の場合は呼び出し元の`tokenize_japanese`が事後的に
+/// 検出してエラーにする）。
+///
+/// スペース（単語の切れ目）を見つけるたびに`pending_delimiter`を立て、
+/// 次に有効なトークンが来た時点で（連続する空白やスキップされた文字を
+/// 挟んでいても）区切りトークンを1つだけ挿入する。これにより、
+/// 「単語の先頭」や「行の先頭」で余分な区切りが重複しないようにしている。
 fn tokenize_with(
     lyrics: &[LyricLine],
     token_id: impl Fn(char) -> Option<usize>,
@@ -163,6 +199,8 @@ fn tokenize_with(
         } else {
             normalize_english(&line.original_text)
         };
+        // 直前の行との間、および行内の最初の単語の前にも区切りを入れる
+        // （最初の行の最初の単語の前だけは入れない）。
         let mut pending_delimiter = !token_ids.is_empty();
         for character in normalized.chars() {
             if character == ' ' {
@@ -193,6 +231,9 @@ fn tokenize_with(
     })
 }
 
+/// 英語テキストの正規化：曲がった引用符をストレートに、アルファベットを
+/// 大文字に統一し、空白類とハイフンは半角スペースへ、それ以外の
+/// 記号は削除する。
 fn normalize_english(text: &str) -> String {
     text.chars()
         .map(|character| match character {
@@ -205,6 +246,10 @@ fn normalize_english(text: &str) -> String {
         .collect()
 }
 
+/// 日本語テキストの正規化：NFKC正規化（全角英数字の半角化、互換文字の
+/// 統一など）を行い、空白類を半角スペースへ、ASCIIアルファベットは
+/// 大文字へ統一する。それ以外の文字（ひらがな・カタカナ・漢字など）は
+/// そのまま残す。
 fn normalize_japanese(text: &str) -> String {
     text.nfkc()
         .map(|character| {
@@ -219,14 +264,21 @@ fn normalize_japanese(text: &str) -> String {
         .collect()
 }
 
+/// ひらがな・カタカナ・CJK統合漢字（拡張Aを含む）の範囲かどうか。
 fn is_japanese_character(character: char) -> bool {
     matches!(character as u32, 0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff)
 }
 
+/// 日本語アライメントにおいて「本来揃えるべき」文字かどうか。
+/// 語彙に存在しないこの種の文字が残っていれば、日本語モデルが
+/// 扱えない文字としてエラー対象にする（長音記号「ー」も含む）。
 fn is_alignable_character(character: char) -> bool {
     is_japanese_character(character) || character.is_ascii_alphanumeric() || character == 'ー'
 }
 
+/// `facebook/wav2vec2-base-960h`の`vocab.json`に固定された、
+/// アルファベット→トークンIDの対応表。このモデル専用の並び順であり、
+/// 他の英語Wav2Vec2モデルでは異なる可能性がある点に注意。
 fn english_token_id(character: char) -> Option<usize> {
     Some(match character {
         '|' => WORD_DELIMITER_ID,

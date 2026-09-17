@@ -1,5 +1,12 @@
+//! タイムラインや時刻補正パネルから呼ばれる、歌詞行の開始・終了時刻を
+//! 操作する純粋関数群。GUI状態を持たず、`&mut LyricLine`（またはその
+//! スライス）だけを扱う。
+
 use crate::domain::lyrics::{LyricLine, TimestampSource};
 
+/// 行の開始時刻を設定する。`end_ms`が新しい開始時刻より前になる場合は
+/// 矛盾を避けるためクリアする。手動操作の結果なので、由来を`Manual`にし、
+/// 古いconfidenceは意味を失うためクリアする。
 pub fn set_start(line: &mut LyricLine, ms: u64) {
     line.start_ms = Some(ms);
     if line.end_ms.is_some_and(|end| end < ms) {
@@ -9,14 +16,16 @@ pub fn set_start(line: &mut LyricLine, ms: u64) {
     line.confidence = None;
 }
 
-/// Set a line's end time explicitly, e.g. from dragging the timeline block's
-/// right-edge handle.
+/// 行の終了時刻を明示的に設定する（タイムラインのブロック右端ハンドルを
+/// ドラッグした場合など）。
 pub fn set_end(line: &mut LyricLine, ms: u64) {
     line.end_ms = Some(ms);
     line.timestamp_source = Some(TimestampSource::Manual);
     line.confidence = None;
 }
 
+/// 行の開始時刻を相対量`delta`だけ動かす。`duration`（音声の長さ）が
+/// あれば、それを超えないようクランプする。
 pub fn shift_start(line: &mut LyricLine, delta: i64, duration: Option<u64>) {
     if let Some(ms) = line.start_ms {
         let shifted = ms.saturating_add_signed(delta);
@@ -24,18 +33,20 @@ pub fn shift_start(line: &mut LyricLine, delta: i64, duration: Option<u64>) {
     }
 }
 
-/// Set one line's start, identified by index within a slice.
+/// スライス内の位置（`index`）で指定した1行の開始時刻を設定する。
 ///
-/// This only touches the targeted line. Earlier lines keep whatever end time
-/// they already had, even if that now leaves a gap or overlap next to this
-/// line — moving one line's boundary should not silently reshape its
-/// neighbor's.
+/// 対象の行だけを変更する。前の行がすでに持っていた終了時刻は、
+/// この結果ギャップやオーバーラップが生じたとしてもそのままにする
+/// ——ある行の境界を動かしたことで、隣の行の境界まで黙って
+/// 書き換えられるべきではない、という考え方による。
 pub fn set_line_start(lines: &mut [LyricLine], index: usize, ms: u64) {
     if let Some(line) = lines.get_mut(index) {
         set_start(line, ms);
     }
 }
 
+/// `index`番目の行の開始時刻を相対量`delta`だけ動かす
+/// （[`set_line_start`]を介して行うので、前の行には影響しない）。
 pub fn shift_line_start(lines: &mut [LyricLine], index: usize, delta: i64, duration: Option<u64>) {
     let Some(current) = lines.get(index).and_then(|line| line.start_ms) else {
         return;
@@ -48,12 +59,12 @@ pub fn shift_line_start(lines: &mut [LyricLine], index: usize, delta: i64, durat
     );
 }
 
-/// Shift every timestamp from `index` by the same effective delta.
+/// `index`以降のすべての時刻を、同じ実効delta分だけまとめて動かす。
 ///
-/// The delta is reduced when necessary so no timestamp crosses zero or the
-/// audio duration. Keeping a common delta preserves spacing between lines in
-/// `index..`. The line before `index` is left untouched, same as
-/// `set_line_start`.
+/// 時刻がゼロや音声の長さを超えないよう、必要に応じてdeltaを縮小する。
+/// 全行に共通の量だけ動かすことで、`index..`内での行同士の間隔は
+/// 保たれる。`index`より前の行は[`set_line_start`]と同様に一切
+/// 変更しない。
 pub fn shift_from(
     lines: &mut [LyricLine],
     index: usize,
@@ -95,7 +106,9 @@ pub fn shift_from(
     delta
 }
 
-/// Move a lyric block to an absolute start while preserving its captured length.
+/// 歌詞ブロックを、その長さ（開始〜終了の幅）を保ったまま絶対位置
+/// `requested_start`へ移動する（タイムライン上でブロック全体を
+/// ドラッグする操作に対応）。
 pub fn move_line_to(
     lines: &mut [LyricLine],
     index: usize,

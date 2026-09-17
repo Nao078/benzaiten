@@ -1,3 +1,8 @@
+//! loftyを使った音楽タグの読み書き。読み込みはGUI表示用に曲名などを
+//! 取得するだけだが、書き込みは「音声ファイルへタグを書き込む」操作から
+//! 明示的に呼ばれ、初回書込み時にバックアップを作成し、対応形式では
+//! 歌詞（LRCテキスト）もタグへ埋め込む。
+
 use std::{
     fs,
     io::Cursor,
@@ -13,6 +18,8 @@ use lofty::{
 
 use crate::domain::project::MusicMetadata;
 
+/// 音声ファイルから読み取った曲名・アーティスト・その他メタデータ・
+/// カバーアート画像データ。プロジェクトを新規作成する際の初期値として使う。
 #[derive(Debug, Default)]
 pub struct AudioMetadata {
     pub title: String,
@@ -21,6 +28,8 @@ pub struct AudioMetadata {
     pub artwork: Option<Vec<u8>>,
 }
 
+/// `path`のタグから曲名・アーティスト・メタデータ・カバーアートを読み取る。
+/// タグが存在しない場合は空の[`AudioMetadata`]を返す（エラーにはしない）。
 pub fn read(path: &Path) -> Result<AudioMetadata, String> {
     let tagged = lofty::read_from_path(path)
         .map_err(|error| format!("音楽情報を読み込めません: {error}"))?;
@@ -63,6 +72,10 @@ pub fn read(path: &Path) -> Result<AudioMetadata, String> {
     })
 }
 
+/// `path`のタグへ曲名・アーティスト・メタデータ・（対応形式なら）歌詞を
+/// 書き込み、必要ならカバーアートも埋め込む。書込み前に、そのファイルへの
+/// 初回書込みであれば`.tag-backup`（[`backup_path`]）を作成する。
+/// 成功時はバックアップファイルのパスを返す。
 pub fn write(
     path: &Path,
     title: &str,
@@ -86,11 +99,11 @@ pub fn write(
     set_item(tag, ItemKey::AlbumTitle, &metadata.album);
     set_item(tag, ItemKey::Genre, &metadata.genre);
     set_item(tag, ItemKey::AlbumArtist, &metadata.album_artist);
-    // `ItemKey::Lyrics` maps to a real tag field for Vorbis Comments (FLAC)
-    // and the MP4 `©lyr` atom, both of which happily hold LRC-formatted
-    // text. ID3v2 (MP3) has no such generic field — synced lyrics there
-    // need a dedicated SYLT frame, which isn't written here — so this is
-    // skipped for MP3 and it keeps relying on a companion .lrc file.
+    // `ItemKey::Lyrics`はVorbis Comment（FLAC）とMP4の`©lyr`アトムでは
+    // 実際のタグ項目に対応しており、どちらもLRC形式のテキストを
+    // 問題なく格納できる。ID3v2（MP3）にはこれに相当する汎用フィールドが
+    // 無く、同期歌詞には専用のSYLTフレームが必要（本関数では書かない）
+    // ため、MP3ではここをスキップし、従来どおり別ファイルの`.lrc`に頼る。
     if matches!(file_type, FileType::Flac | FileType::Mp4) {
         match lyrics {
             Some(text) if !text.trim().is_empty() => set_item(tag, ItemKey::Lyrics, text),
@@ -137,6 +150,8 @@ pub fn write(
     Ok(backup)
 }
 
+/// 値が空（トリム後）でなければタグ項目を設定し、空なら削除する。
+/// 空文字列を書き込んで意味のないタグ項目を残さないようにする。
 fn set_item(tag: &mut Tag, key: ItemKey, value: &str) {
     tag.remove_key(key);
     if !value.trim().is_empty() {
@@ -144,6 +159,8 @@ fn set_item(tag: &mut Tag, key: ItemKey, value: &str) {
     }
 }
 
+/// 元ファイルと同じ場所・同じ拡張子ベースに`.tag-backup`を付けたパスを返す
+/// （例：`song.mp3` → `song.mp3.tag-backup`）。
 fn backup_path(path: &Path) -> PathBuf {
     let extension = path
         .extension()

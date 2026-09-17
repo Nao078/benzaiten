@@ -1,4 +1,4 @@
-# 弁才天 (Benzaiten)
+# Benzaiten
 
 ローカル音声と正解歌詞をCTC Forced Alignmentで直接照合し、行ごとの開始時刻を持つLRCを作るRustデスクトップアプリです。MP3/WAVをffmpegで16 kHz mono PCM WAVに変換し、Wav2Vec2 ONNXモデルの音響フレームへ正解歌詞を割り当てます。
 

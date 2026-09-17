@@ -1,9 +1,19 @@
+//! 下部タイムラインの描画とドラッグ操作。原文・カタカナの2トラックに
+//! 歌詞ブロックを表示し、ブロック全体のドラッグ移動、左右端ハンドルに
+//! よる開始・終了個別調整、右クリックメニューでの追従移動トグルに
+//! 対応する。このモジュール自体はGUIの状態を持たず、フレームごとに
+//! 現在の状態を受け取って描画し、発生した操作を[`TimelineAction`]の
+//! 一覧として返す（実際の状態変更は呼び出し側の`app.rs`が行う）。
+
 use crate::domain::lyrics::LyricLine;
 use eframe::egui;
 
 pub const MIN_ZOOM: f32 = 12.0;
 pub const MAX_ZOOM: f32 = 600.0;
 
+/// ブロック全体のドラッグ移動中に保持する起点情報。`start_ms`は
+/// フレームごとに更新され、次のフレームの差分（delta）が積み上がって
+/// いく形で移動を計算する。
 #[derive(Debug, Clone, Copy)]
 pub struct DragAnchor {
     pub index: usize,
@@ -11,12 +21,15 @@ pub struct DragAnchor {
     pub length_ms: Option<u64>,
 }
 
+/// リサイズハンドルがどちら側（開始・終了）かを表す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeEdge {
     Start,
     End,
 }
 
+/// 端ハンドルによるリサイズ中に保持する起点情報。`ms`は[`DragAnchor`]の
+/// `start_ms`と同様、フレームごとに更新される。
 #[derive(Debug, Clone, Copy)]
 pub struct ResizeAnchor {
     pub index: usize,
@@ -24,6 +37,8 @@ pub struct ResizeAnchor {
     pub ms: u64,
 }
 
+/// `show`が1フレームで検出した操作。呼び出し側（`app.rs`）が
+/// これを見て実際に歌詞データや再生位置を変更する。
 #[derive(Debug, Clone, Copy)]
 pub enum TimelineAction {
     Select(usize),
@@ -44,11 +59,14 @@ pub enum TimelineAction {
         delta_ms: i64,
     },
     EndResize,
-    /// Toggled from a block's right-click menu: while enabled, dragging a
-    /// block also carries every later line along by the same amount.
+    /// ブロックの右クリックメニューから切り替えられる。有効な間は、
+    /// ブロックをドラッグすると、それ以降のすべての行も同じ量だけ
+    /// 一緒に移動する。
     SetLinkedTailMovement(bool),
 }
 
+/// 再生位置・曲の長さ・再生中かどうか。プレイヘッドの描画と、
+/// 再生中の自動追従スクロールに使う。
 #[derive(Debug, Clone, Copy)]
 pub struct PlaybackState {
     pub position_ms: u64,
@@ -56,6 +74,9 @@ pub struct PlaybackState {
     pub is_playing: bool,
 }
 
+/// ドラッグ・リサイズの進行中状態と、追従移動トグルの現在値をまとめた
+/// もの。`show`の引数をこれ以上増やさない（clippyの`too_many_arguments`
+/// を超えない）ためにひとまとめにしている。
 #[derive(Debug, Clone, Copy)]
 pub struct InteractionState {
     pub drag_anchor: Option<DragAnchor>,
@@ -63,6 +84,7 @@ pub struct InteractionState {
     pub linked_tail_movement: bool,
 }
 
+/// タイムライン全体を描画し、このフレームで発生した操作を返す。
 pub fn show(
     ui: &mut egui::Ui,
     lyrics: &[LyricLine],
@@ -87,9 +109,9 @@ pub fn show(
     let mut actions = Vec::new();
 
     ui.horizontal(|ui| {
-        // `allocate_ui` would otherwise inherit this closure's horizontal
-        // layout and lay the two labels out side by side instead of one
-        // per track row.
+        // `allocate_ui`のままだと、この閉包の水平レイアウトを継承して
+        // しまい、2つのラベルがトラックごとに1行ずつではなく横並びに
+        // なってしまう。
         ui.allocate_ui_with_layout(
             egui::vec2(LABEL_WIDTH, height),
             egui::Layout::top_down(egui::Align::Min),
@@ -108,8 +130,8 @@ pub fn show(
             .id_salt("lyrics-timeline-scroll")
             .auto_shrink([false, false]);
         if playback.is_playing {
-            // Keep the playhead in view instead of letting playback silently
-            // scroll past the visible window.
+            // 再生中は、プレイヘッドが表示範囲の外へ黙って流れていって
+            // しまわないよう、常に画面内に収まるようスクロール位置を追従させる。
             let target = (playback.position_ms as f32 / 1000.0 * *zoom - viewport_width / 2.0)
                 .clamp(0.0, (content_width - viewport_width).max(0.0));
             scroll_area = scroll_area.horizontal_scroll_offset(target);
@@ -260,11 +282,11 @@ pub fn show(
                         });
                     }
 
-                    // Thin grab handles on the block's edges let the user
-                    // trim just the start or end time. Interacting with
-                    // these after the whole-block `response` above gives
-                    // them hit-test priority over the move gesture at those
-                    // pixel columns.
+                    // ブロック端の細いつかみハンドル。開始・終了時刻だけを
+                    // 個別に調整できるようにする。上の「ブロック全体」の
+                    // `response`より後にこれらをinteractさせることで、
+                    // 該当ピクセル列では移動操作よりヒットテストの
+                    // 優先度が高くなる。
                     const HANDLE_WIDTH: f32 = 6.0;
                     if rect.width() > HANDLE_WIDTH * 3.0 {
                         let start_handle = egui::Rect::from_min_max(
@@ -358,6 +380,7 @@ pub fn show(
     actions
 }
 
+/// タイムライン上の目盛りに表示する`mm:ss`表記。
 fn format_ruler_time(milliseconds: u64) -> String {
     let seconds = milliseconds / 1000;
     format!("{:02}:{:02}", seconds / 60, seconds % 60)

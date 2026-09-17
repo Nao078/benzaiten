@@ -1,3 +1,7 @@
+//! Forced Alignmentパイプライン全体（ffmpeg前処理→ONNX推論→整列）を、
+//! GUIからはキャンセル可能な非同期ジョブとして、CLIからは同期関数
+//! として実行できるようにする。
+
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -10,6 +14,8 @@ use std::{
 
 use crate::domain::lyrics::LyricLine;
 
+/// パイプライン実行に必要な外部ツール・モデルの設定一式。
+/// GUIでは「外部ツール設定」ダイアログの内容がこれになる。
 #[derive(Debug, Clone)]
 pub struct ToolSettings {
     pub ffmpeg: PathBuf,
@@ -20,6 +26,8 @@ pub struct ToolSettings {
 }
 
 impl ToolSettings {
+    /// 実行前に、選択言語に応じて必要なモデル・語彙ファイルが揃っているか
+    /// 検証する。日本語の場合は`vocabulary`（tokenizer.json）が必須。
     pub fn validate_model(&self, lyrics: &[LyricLine]) -> Result<(), String> {
         if self.model.as_os_str().is_empty() {
             return Err("Forced Alignmentモデルが未設定です。「外部ツール設定」→「モデル」→「参照」で、Wav2Vec2 ONNXモデルを選択してください。".into());
@@ -56,14 +64,16 @@ impl Default for ToolSettings {
     }
 }
 
+/// バックグラウンドジョブからGUIへ送られるイベント。`Stage`は
+/// ステータスバーに表示する進捗メッセージ、`Finished`は最終結果。
 #[derive(Debug)]
 pub enum JobEvent {
     Stage(String),
     Finished(Result<Vec<LyricLine>, String>),
 }
 
-/// A single background alignment pipeline. Its receiver is non-blocking so it
-/// can be polled from the GUI event loop.
+/// 1回分のバックグラウンドアライメントパイプライン。受信は
+/// ノンブロッキングなので、GUIのイベントループから毎フレームpollできる。
 pub struct Job {
     receiver: Receiver<JobEvent>,
     cancel: Arc<AtomicBool>,
@@ -71,6 +81,8 @@ pub struct Job {
 }
 
 impl Job {
+    /// 別スレッドでパイプラインを開始する。進捗・結果は`try_recv`で
+    /// 取得する。
     pub fn start(audio: PathBuf, lyrics: Vec<LyricLine>, settings: ToolSettings) -> Self {
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -92,13 +104,15 @@ impl Job {
         self.receiver.try_recv()
     }
 
+    /// キャンセルフラグを立てる。ワーカースレッドの終了は待たない
+    /// （最終的な`Finished`イベントをGUI側でまだ表示できるようにするため）。
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
     }
 
-    /// Stop the worker and wait until its child process has been reaped.
-    /// Call this while shutting down the application; ordinary GUI cancellation
-    /// should use [`Self::cancel`] so the final event can still be displayed.
+    /// ワーカーを停止させ、子プロセスが完全に後始末されるまで待つ。
+    /// アプリ終了時に呼ぶこと。通常のGUI操作によるキャンセルは、
+    /// 最終イベントをまだ表示できるよう[`Self::cancel`]を使うこと。
     pub fn shutdown(&mut self) {
         self.cancel();
         if let Some(worker) = self.worker.take() {
@@ -113,7 +127,7 @@ impl Drop for Job {
     }
 }
 
-/// Run the same pipeline synchronously for the command-line entry point.
+/// CLIエントリポイント向けに、同じパイプラインを同期的に実行する。
 pub fn run_sync(
     audio: &Path,
     lyrics: &[LyricLine],
@@ -128,6 +142,11 @@ pub fn run_sync(
     )
 }
 
+/// パイプライン本体：入力検証 → ffmpeg前処理 → モデル読込 → 音響推論 →
+/// 言語判定 → Forced Alignment、の順に実行する。各段階の間で
+/// `check_cancelled`を挟み、キャンセルされていれば早期に打ち切る。
+/// `stage`コールバックには各段階の進捗メッセージを渡す（GUIではこれを
+/// ステータスバーに表示する）。
 fn run_with_events(
     audio: &Path,
     lyrics: &[LyricLine],
@@ -187,6 +206,8 @@ fn run_with_events(
     aligned
 }
 
+/// パイプライン実行前の前提条件（音声ファイル・ffmpeg・モデル・語彙・
+/// スレッド数）を検証する。
 fn validate(audio: &Path, lyrics: &[LyricLine], settings: &ToolSettings) -> Result<(), String> {
     if !audio.is_file() {
         return Err(format!("audio file was not found: {}", audio.display()));

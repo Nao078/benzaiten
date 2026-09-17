@@ -1,3 +1,7 @@
+//! GUI本体：`BenzaitenApp`（eframe::Appの実装）、3ペイン＋下部タイムラインの
+//! 描画、メニューバーのコマンド処理、音声再生・タグ書込み・LRC出力などの
+//! 操作を1ファイルに集約している。
+
 use crate::{
     audio::player::AudioPlayer,
     domain::{
@@ -15,6 +19,7 @@ use crate::{
     },
 };
 
+/// 右ペインの歌詞リストに何を表示するか（原文のみ／カタカナのみ／両方）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LyricsDisplayMode {
     Original,
@@ -22,6 +27,9 @@ enum LyricsDisplayMode {
     OriginalAndReading,
 }
 
+/// メニューバー・キーボードショートカットから発行される、遅延実行の
+/// コマンド。フレーム内で一旦`Option<AppCommand>`に集約し、
+/// `execute_command`でまとめて処理する。
 #[derive(Debug, Clone, Copy)]
 enum AppCommand {
     OpenProject,
@@ -35,11 +43,10 @@ enum AppCommand {
     WriteAudioTags(AudioTagFormat),
 }
 
-/// Which audio container to write tags for, chosen from the "音声ファイルへ
-/// タグを書き込む" submenu. Only FLAC and M4A have a generic lyrics tag that
-/// lofty can write (Vorbis Comment / `©lyr`); MP3's ID3v2 has no equivalent
-/// without a dedicated SYLT frame, so it keeps using a companion .lrc file
-/// instead, same as before this feature existed.
+/// 「音声ファイルへタグを書き込む」サブメニューで選ぶ、タグ書込み先の
+/// 音声コンテナ形式。FLACとM4Aだけがloftyで書き込める汎用の歌詞タグ
+/// （Vorbis Comment／`©lyr`）を持つ。MP3のID3v2には専用のSYLTフレームが
+/// 無いと同等のことができないため、従来どおり別ファイルの`.lrc`を使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudioTagFormat {
     Mp3WithLrc,
@@ -48,6 +55,7 @@ enum AudioTagFormat {
 }
 
 impl AudioTagFormat {
+    /// 変換先ファイルに使う拡張子。
     fn extension(self) -> &'static str {
         match self {
             AudioTagFormat::Mp3WithLrc => "mp3",
@@ -56,6 +64,7 @@ impl AudioTagFormat {
         }
     }
 
+    /// 確認ダイアログなどの表示に使うラベル。
     fn label(self) -> &'static str {
         match self {
             AudioTagFormat::Mp3WithLrc => "MP3",
@@ -64,9 +73,9 @@ impl AudioTagFormat {
         }
     }
 
-    /// ffmpeg codec arguments used only when converting into this format
-    /// from a lossless source. A reasonably high quality/bitrate is used
-    /// since this is meant to be a single, one-time lossy encode.
+    /// 可逆音源からこの形式へ変換するときだけ使うffmpegコーデック引数。
+    /// 1回限りの非可逆エンコードとなるため、十分な品質・ビットレートを
+    /// 指定している。
     fn ffmpeg_codec_args(self) -> &'static [&'static str] {
         match self {
             AudioTagFormat::Mp3WithLrc => &["-c:a", "libmp3lame", "-q:a", "2"],
@@ -76,10 +85,10 @@ impl AudioTagFormat {
     }
 }
 
-/// Guesses which [`AudioTagFormat`] applies to `path` from its extension, so
-/// the submenu can gray out the entries that don't match the loaded audio
-/// file. The actual write still re-detects the real container via lofty, so
-/// a misleading extension can't cause lyrics to land in the wrong tag.
+/// `path`の拡張子から、対応する[`AudioTagFormat`]を推測する。サブメニューで
+/// 読み込み中の音声と一致しない項目をグレーアウトするために使う。実際の
+/// 書込み時にはloftyが実ファイルの種別を改めて判定するため、拡張子を
+/// 偽装されても誤った種類のタグに歌詞が書き込まれることはない。
 fn detected_audio_tag_format(path: &Path) -> Option<AudioTagFormat> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
@@ -90,15 +99,14 @@ fn detected_audio_tag_format(path: &Path) -> Option<AudioTagFormat> {
     }
 }
 
-/// Extensions this app treats as lossless, and therefore safe to freely
-/// convert to any of the three tag-embedding targets without compounding
-/// lossy compression. Converting a *lossy* source (MP3, or AAC in an M4A)
-/// would either double-compress it (going to another lossy format) or wrap
-/// already-degraded audio in a lossless container for no benefit, so only
-/// each lossy format's own matching menu entry stays enabled for those.
+/// このアプリが「可逆」として扱う拡張子。可逆音源であれば、非可逆圧縮を
+/// 重ねることなく3つのタグ埋め込み先すべてへ自由に変換できる。*非可逆*な
+/// 音源（MP3、あるいはM4A内のAAC）を変換すると、別の非可逆形式への
+/// 二重圧縮になるか、劣化済みの音声を可逆コンテナへ包むだけで意味がない
+/// ため、これらは自分自身と一致するメニュー項目だけを有効にする。
 ///
-/// `.m4a` is assumed to hold lossy AAC, the overwhelming common case; this
-/// app does not attempt to detect lossless ALAC inside an M4A container.
+/// `.m4a`は（圧倒的に多いケースである）非可逆のAACを保持していると
+/// 仮定している。M4Aコンテナ内の可逆ALAC音声を検出する処理は行わない。
 fn is_lossless_audio_extension(extension: &str) -> bool {
     matches!(extension, "wav" | "flac")
 }
@@ -110,6 +118,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// 開発時のカレントディレクトリ、または実行ファイルの祖先ディレクトリ
+/// から`relative`（例：`models/wav2vec2-base-960h.onnx`）を探す。
+/// `cargo run`実行時と、ビルド済みexeを別の場所から実行する場合の
+/// 両方で既定パスを解決できるようにするための処理。
 fn find_project_file(relative: &Path) -> Option<PathBuf> {
     if let Ok(current_dir) = std::env::current_dir() {
         let candidate = current_dir.join(relative);
@@ -127,6 +139,9 @@ fn find_project_file(relative: &Path) -> Option<PathBuf> {
     None
 }
 
+/// `position_ms`時点でアクティブな（ハイライト対象の）歌詞行のインデックス
+/// を返す。行は`start_ms <= position < end_ms`で判定し、`end_ms`が無い
+/// 行は次に時刻が設定されている行の`start_ms`を境界として扱う。
 fn active_lyric_index(
     lyrics: &[crate::domain::project::LyricLine],
     position_ms: u64,
@@ -142,6 +157,13 @@ fn active_lyric_index(
     })
 }
 
+/// 原文入力欄のテキストを再パースしつつ、変更されていない行については
+/// 既存の時刻・カタカナ読みなどのデータを引き継ぐ。
+///
+/// まず新しいテキストを行ごとにパースし、各新規行を`original_text`が
+/// 一致する未使用の旧行と対応付ける（同じ位置を優先し、無ければ他の
+/// 位置から探す）。これにより、歌詞の一部を編集しても、変更していない
+/// 行のアライメント結果や手動補正が失われないようにしている。
 fn merge_original_lyrics(
     previous: Vec<crate::domain::project::LyricLine>,
     input: &str,
@@ -183,14 +205,20 @@ fn merge_original_lyrics(
     parsed
 }
 
+/// アプリ全体の状態。`eframe::App`を実装し、`update`が毎フレーム呼ばれる。
 pub struct BenzaitenApp {
     project: Project,
     player: Option<AudioPlayer>,
+    /// タイムライン・時刻補正パネルで選択中の歌詞行インデックス。
     selected: Option<usize>,
     lyrics_display_mode: LyricsDisplayMode,
     job: Option<Job>,
     job_started_at: Option<Instant>,
+    /// 歌詞やプロジェクトが変更されるたびに増える世代カウンタ。
     generation: u64,
+    /// ジョブ開始時点の`generation`のスナップショット。ジョブ完了時に
+    /// `generation`と食い違っていれば、開始後に入力が変わったということ
+    /// なので、結果を古いものとして破棄する（`poll_job`参照）。
     job_generation: u64,
     status: String,
     ffmpeg: String,
@@ -200,26 +228,39 @@ pub struct BenzaitenApp {
     language: String,
     alignment_threads: usize,
     project_path: Option<PathBuf>,
+    /// 保存されていない変更があるかどうか。ウィンドウを閉じる際などの
+    /// 破棄確認に使う。
     dirty: bool,
+    /// 現在のアートワークの生データ（画像デコード前）。
     artwork_bytes: Option<Vec<u8>>,
+    /// `artwork_bytes`をGPUテクスチャへデコードしたもの。`None`のときは
+    /// 次フレームで`ensure_artwork_texture`が再デコードする。
     artwork_texture: Option<egui::TextureHandle>,
     auto_scroll: bool,
+    /// 直前フレームでハイライトしていた行。自動スクロールを行変化時
+    /// だけに起動するための比較に使う。
     last_highlighted: Option<usize>,
     workspace_root: PathBuf,
+    /// 時刻補正パネルの「調整幅」（±ボタンの移動量）。
     bulk_shift_ms: i64,
     show_external_tools: bool,
     timeline_zoom: f32,
     timeline_drag: Option<DragAnchor>,
     timeline_resize: Option<ResizeAnchor>,
     timeline_link_tail_movement: bool,
+    /// 左ペインの原文テキストエリアの生テキスト（`project.lyrics`とは
+    /// 別に保持し、パース失敗時も入力内容を保持できるようにしている）。
     original_lyrics_input: String,
     reading_lyrics_input: String,
 }
 
 impl BenzaitenApp {
+    /// eframeのウィンドウ生成時に一度だけ呼ばれる初期化処理。日本語フォント
+    /// の探索と、外部ツール（ffmpeg・モデル・語彙）の既定パス解決を行う。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut fonts = egui::FontDefinitions::default();
-        // Use an installed Japanese font without redistributing proprietary fonts.
+        // 独自の日本語フォントを同梱・再配布せず、OSに入っている
+        // フォントを順に探して使う。
         let candidates = [
             "C:/Windows/Fonts/meiryo.ttc",
             "C:/Windows/Fonts/YuGothR.ttc",
@@ -289,16 +330,23 @@ impl BenzaitenApp {
         }
     }
 
+    /// プロジェクトが変更されたことを記録する。`generation`を進めて
+    /// 実行中のジョブの結果を無効化できるようにし、`dirty`を立てて
+    /// 未保存インジケータを表示する。歌詞・タグ・音声パスなどを
+    /// 変更する箇所は必ずこれを呼ぶ。
     fn changed(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.dirty = true;
     }
+    /// 処理結果をステータスバー用の文字列に変換して設定する。
     fn report(&mut self, result: Result<(), String>, success: &str) {
         self.status = match result {
             Ok(()) => success.into(),
             Err(e) => format!("エラー: {e}"),
         };
     }
+    /// 未保存の変更を破棄してよいか確認する。変更が無ければ確認なしで
+    /// 続行を許可し、あればダイアログでユーザーに確認する。
     fn allow_discard(&self) -> bool {
         !self.dirty
             || rfd::MessageDialog::new()
@@ -309,6 +357,9 @@ impl BenzaitenApp {
                 == rfd::MessageDialogResult::Yes
     }
 
+    /// `project.lyrics`の内容から、左ペインの原文・カタカナ入力欄の
+    /// テキストを再構築する。プロジェクトを開いた直後や、Forced
+    /// Alignment完了後など、`project.lyrics`側が正になった後に呼ぶ。
     fn sync_lyric_inputs_from_project(&mut self) {
         self.original_lyrics_input = self
             .project
@@ -326,6 +377,11 @@ impl BenzaitenApp {
             .join("\n");
     }
 
+    /// 原文テキストエリアの編集を`project.lyrics`へ反映する。編集のたびに
+    /// 呼ばれるため、[`merge_original_lyrics`]で変更されていない行の
+    /// 時刻・読みを保ったまま再構築する。行数が変わることがあるので、
+    /// カタカナ入力欄も合わせて再同期し、選択中インデックスが範囲外に
+    /// なっていれば解除する。
     fn apply_original_lyrics_input(&mut self) {
         let previous = std::mem::take(&mut self.project.lyrics);
         self.project.lyrics = merge_original_lyrics(previous, &self.original_lyrics_input);
@@ -342,6 +398,9 @@ impl BenzaitenApp {
         self.changed();
     }
 
+    /// カタカナテキストエリアの編集を`project.lyrics`へ反映する。原文より
+    /// 行数が多い場合はエラーにする（少ない場合は残りの行の読みを未設定
+    /// のままにする）。
     fn apply_reading_lyrics_input(&mut self) {
         let rows = self
             .reading_lyrics_input
@@ -372,6 +431,7 @@ impl BenzaitenApp {
         self.status = format!("カタカナ歌詞を{count}行反映しました");
     }
 
+    /// 「プロジェクトを開く」ファイルダイアログを表示する。
     fn open_project_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Project", &["json"])
@@ -381,6 +441,9 @@ impl BenzaitenApp {
         }
     }
 
+    /// プロジェクトを保存する。`save_as`が`false`かつ既存の保存先が
+    /// あればそこへ上書き保存し、それ以外は保存先ダイアログを表示する
+    /// （既存パスがあればその場所・ファイル名を初期値にする）。
     fn save_project(&mut self, save_as: bool) {
         let path = if !save_as {
             self.project_path.clone()
@@ -413,6 +476,7 @@ impl BenzaitenApp {
         self.report(result, "プロジェクトを保存しました");
     }
 
+    /// 「LRC出力」の保存先ダイアログを表示し、選択されたパスへ書き出す。
     fn export_lrc_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("LRC", &["lrc"])
@@ -424,6 +488,7 @@ impl BenzaitenApp {
         }
     }
 
+    /// 「音声を開く」ファイルダイアログを表示する。
     fn open_audio_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Audio", &["mp3", "wav", "flac", "ogg", "m4a"])
@@ -433,6 +498,8 @@ impl BenzaitenApp {
         }
     }
 
+    /// 「原文歌詞を開く」ファイルダイアログを表示する（未保存の変更が
+    /// あれば先に破棄確認を行う）。
     fn open_original_lyrics_dialog(&mut self) {
         if self.allow_discard() {
             if let Some(path) = rfd::FileDialog::new()
@@ -444,6 +511,8 @@ impl BenzaitenApp {
         }
     }
 
+    /// 「カタカナ歌詞を開く」ファイルダイアログを表示する
+    /// （原文が未読込の場合は先にそちらを促す）。
     fn open_reading_lyrics_dialog(&mut self) {
         if self.project.lyrics.is_empty() {
             self.status = "先に原文歌詞を読み込んでください".into();
@@ -455,6 +524,7 @@ impl BenzaitenApp {
         }
     }
 
+    /// フレーム内で集約された[`AppCommand`]を実際の処理へディスパッチする。
     fn execute_command(&mut self, command: AppCommand) {
         match command {
             AppCommand::OpenProject => self.open_project_dialog(),
@@ -469,6 +539,8 @@ impl BenzaitenApp {
         }
     }
 
+    /// 「外部ツール設定」ダイアログの中身：歌詞言語の選択、ffmpeg・各種
+    /// モデルのパス設定、CPUスレッド数、配布元へのリンク。
     fn show_external_tools_ui(&mut self, ui: &mut egui::Ui) {
         ui.label("自動同期にはffmpegと選択言語のWav2Vec2 ONNXモデルが必要です。");
         let detected = crate::forced_alignment::tokenizer::detect_language(&self.project.lyrics);
@@ -520,6 +592,8 @@ impl BenzaitenApp {
         );
     }
 
+    /// `timeline::show`が返した[`TimelineAction`]群を処理し、選択状態・
+    /// 歌詞の時刻・再生位置・追従移動トグルなどへ反映する。
     fn handle_timeline_actions(&mut self, actions: Vec<TimelineAction>, duration: Option<u64>) {
         for action in actions {
             match action {
@@ -552,11 +626,11 @@ impl BenzaitenApp {
                     if let Some(anchor) = self.timeline_drag.filter(|anchor| anchor.index == index)
                     {
                         if self.timeline_link_tail_movement {
-                            // `delta_ms` is already this frame's incremental
-                            // pointer movement, so applying it directly to
-                            // the group's current (already-shifted) start
-                            // times accumulates correctly frame over frame,
-                            // no anchor bookkeeping needed here.
+                            // `delta_ms`はすでに「このフレームでの」増分な
+                            // ので、現在の（前フレームまでにすでに移動済みの）
+                            // 開始時刻へそのまま加算していけばフレームを
+                            // 重ねるごとに正しく積み上がる。アンカーの
+                            // 記録は不要。
                             lyric_editor::shift_from(
                                 &mut self.project.lyrics,
                                 index,
@@ -572,12 +646,12 @@ impl BenzaitenApp {
                                 anchor.length_ms,
                                 duration,
                             );
-                            // `delta_ms` is the pointer movement since the
-                            // previous frame (egui's `drag_delta`), not since
-                            // the drag started. Roll it into the anchor so
-                            // the next frame's delta keeps building on the
-                            // new position instead of snapping back toward
-                            // the drag's starting point.
+                            // `delta_ms`はドラッグ開始からの累計ではなく、
+                            // 前フレームからのポインタ移動量（eguiの
+                            // `drag_delta`）。これをアンカーへ反映しておく
+                            // ことで、次フレームのdeltaが新しい位置を基準に
+                            // 積み上がっていき、ドラッグ開始位置へ
+                            // 戻ってしまうことがなくなる。
                             self.timeline_drag = Some(DragAnchor {
                                 index,
                                 start_ms: start,
@@ -624,8 +698,9 @@ impl BenzaitenApp {
                         .filter(|anchor| anchor.index == index && anchor.edge == edge)
                     {
                         let requested = anchor.ms.saturating_add_signed(delta_ms);
-                        // Keep at least MIN_LENGTH_MS between start and end so a
-                        // fast drag can't push one handle past the other.
+                        // 開始・終了の間を最低MIN_LENGTH_MSだけ空けておく。
+                        // 速いドラッグで片方のハンドルがもう一方を
+                        // 追い越してしまわないようにするため。
                         let applied = self.project.lyrics.get_mut(index).map(|line| match edge {
                             ResizeEdge::Start => {
                                 let max_start = line
@@ -661,6 +736,9 @@ impl BenzaitenApp {
             }
         }
     }
+    /// 音声ファイルを切り替える。すでに時刻が設定された行がある状態で
+    /// 別の音声へ切り替える場合は、その時刻がもう意味を持たなくなるため
+    /// 確認の上ですべて解除する。
     fn set_audio_file(&mut self, path: PathBuf) {
         if self.project.audio_path != path
             && self
@@ -690,6 +768,9 @@ impl BenzaitenApp {
         self.load_audio(true);
     }
 
+    /// ファイルから原文歌詞を読み込み、プロジェクトを丸ごと置き換える
+    /// （テキストエリア編集時の[`merge_original_lyrics`]とは異なり、
+    /// 既存の時刻・読みは引き継がない）。
     fn load_original_file(&mut self, path: &Path) {
         match std::fs::read_to_string(path) {
             Ok(text) => {
@@ -703,6 +784,7 @@ impl BenzaitenApp {
         }
     }
 
+    /// ファイルからカタカナ読みを読み込み、[`apply_readings`]で適用する。
     fn load_reading_file(&mut self, path: &Path) {
         if self.project.lyrics.is_empty() {
             self.status = "先に原文歌詞を読み込んでください".into();
@@ -721,6 +803,8 @@ impl BenzaitenApp {
         }
     }
 
+    /// プロジェクトJSONを開き、現在の状態を丸ごと置き換える
+    /// （未保存の変更があれば先に破棄確認を行う）。
     fn open_project_file(&mut self, path: PathBuf) {
         if !self.allow_discard() {
             return;
@@ -740,6 +824,8 @@ impl BenzaitenApp {
         }
     }
 
+    /// Windows Explorerからのドラッグ＆ドロップなど、拡張子だけを
+    /// 手掛かりにファイルの種類を判定して適切な読込処理へ振り分ける。
     fn open_file_default(&mut self, path: PathBuf) {
         let extension = path
             .extension()
@@ -762,6 +848,10 @@ impl BenzaitenApp {
             _ => self.status = format!("未対応のファイルです: {}", path.display()),
         }
     }
+    /// `project.audio_path`から`AudioPlayer`を開き直す。`import_metadata`が
+    /// `true`のときだけ、音声タグから曲名・アーティスト・メタデータを
+    /// プロジェクトへ取り込む（既存プロジェクトを開いた場合は上書きしない）。
+    /// アートワークは`import_metadata`に関わらず毎回読み直す。
     fn load_audio(&mut self, import_metadata: bool) {
         match AudioPlayer::open(&self.project.audio_path) {
             Ok(player) => {
@@ -794,6 +884,8 @@ impl BenzaitenApp {
         }
     }
 
+    /// `artwork_bytes`がまだGPUテクスチャ化されていなければデコードする。
+    /// 毎フレーム呼んでも、すでにテクスチャがあれば何もしない。
     fn ensure_artwork_texture(&mut self, ctx: &egui::Context) {
         if self.artwork_texture.is_some() {
             return;
@@ -812,6 +904,8 @@ impl BenzaitenApp {
         }
     }
 
+    /// タグ書込みの前に確認ダイアログを出す。変換が必要かどうかで
+    /// 文言を変える（変換ありなら「新しいファイルを作成する」旨を明示）。
     fn confirm_and_write_audio_tags(&mut self, format: AudioTagFormat) {
         if self.project.audio_path.as_os_str().is_empty() {
             return;
@@ -847,11 +941,10 @@ impl BenzaitenApp {
         }
     }
 
-    /// Converts the current audio to `format` via ffmpeg, writing a new file
-    /// alongside the original (which is left untouched) and returning its
-    /// path. Only called for a lossless source, so this is a single,
-    /// one-time lossy encode when the target itself is lossy — never a
-    /// second generation of lossy compression.
+    /// 現在の音声をffmpegで`format`へ変換し、元ファイルはそのまま残して
+    /// 同じ場所に新しいファイルを作成し、そのパスを返す。可逆音源に対して
+    /// のみ呼ばれる想定なので、対象が非可逆形式でも1回限りのエンコードで
+    /// 済み、非可逆圧縮が重なることはない。
     fn convert_audio_for_tag_format(&self, format: AudioTagFormat) -> Result<PathBuf, String> {
         let target_path = self.project.audio_path.with_extension(format.extension());
         if target_path.exists() {
@@ -869,12 +962,13 @@ impl BenzaitenApp {
             .map(|_| target_path)
     }
 
+    /// 実際にタグを書き込む。必要なら先にffmpeg変換を行い、その後
+    /// タグ・（対応形式なら）歌詞の埋め込み、（MP3なら）`.lrc`出力を行う。
     fn write_audio_tags(&mut self, format: AudioTagFormat) {
-        // Render once up front and bail before touching the audio file at
-        // all if the lyrics aren't in an exportable state (missing
-        // timestamps, reversed order, ...) — the same validation the
-        // ordinary LRC export applies. Both the embedded-tag path and the
-        // companion-file path need this text.
+        // 最初に一度だけレンダリングし、歌詞が出力可能な状態でない
+        // （時刻未設定・時刻の逆転など）場合は、音声ファイルに一切
+        // 触れずに中止する。通常のLRC出力と同じ検証を適用している。
+        // 埋め込み・別ファイル出力のどちらの経路でもこのテキストを使う。
         let lyrics = match writer::render(&self.project) {
             Ok(text) => text,
             Err(error) => {
@@ -887,9 +981,9 @@ impl BenzaitenApp {
         if converted {
             match self.convert_audio_for_tag_format(format) {
                 Ok(converted_path) => {
-                    // Same audio content, just re-encoded, so the existing
-                    // line timestamps are still valid — unlike swapping to a
-                    // genuinely different audio file, nothing needs resetting.
+                    // 音声の中身自体は同じで再エンコードしただけなので、
+                    // 既存の行の時刻はそのまま有効——別の音声へ本当に
+                    // 切り替える場合とは異なり、リセットは不要。
                     self.project.audio_path = converted_path;
                     self.changed();
                 }
@@ -962,6 +1056,9 @@ impl BenzaitenApp {
         }
     }
 
+    /// 「歌唱向けカタカナ自動生成」を実行する。手動入力・手修正済み
+    /// （`ReadingSource::Manual`）の行はスキップして上書きしない。
+    /// 辞書に無かった単語はまとめてステータスバーに表示する。
     fn generate_readings(&mut self) {
         let engine = EnglishPronunciationEngine;
         let mut generated = 0;
@@ -1007,6 +1104,10 @@ impl BenzaitenApp {
             )
         };
     }
+    /// 実行中の[`Job`]からのイベントを毎フレーム確認する。`Stage`は
+    /// ステータス表示のみ、`Finished`ではジョブ開始後に入力が変更されて
+    /// いないか（`job_generation`と`generation`の比較）を確認してから
+    /// 結果を反映する。
     fn poll_job(&mut self) {
         let event = self.job.as_ref().map(|j| j.try_recv());
         match event {
@@ -1045,6 +1146,9 @@ impl eframe::App for BenzaitenApp {
         }
     }
 
+    /// eguiが毎フレーム呼ぶメインループ。ジョブのポーリング、ドロップ
+    /// ファイルの処理、キーボードショートカット、メニューバー、左右の
+    /// パネル、下部タイムライン、中央パネルを順に描画・処理する。
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job();
         self.ensure_artwork_texture(ctx);
@@ -1117,10 +1221,10 @@ impl eframe::App for BenzaitenApp {
                     ui.separator();
                     ui.menu_button("音声ファイルへタグを書き込む", |ui| {
                         let detected = detected_audio_tag_format(&self.project.audio_path);
-                        // A lossless source (WAV/FLAC) can be freely converted to
-                        // any target; a lossy source (MP3, M4A) only allows its
-                        // own matching entry so we never compound lossy
-                        // compression or wrap already-lossy audio pointlessly.
+                        // 可逆音源（WAV/FLAC）は好きな形式へ自由に変換できる
+                        // が、非可逆音源（MP3、M4A）は一致する項目しか
+                        // 選べないようにし、非可逆圧縮を重ねたり、劣化済み
+                        // 音声を無意味に包んだりしないようにする。
                         let lossless_source = self
                             .project
                             .audio_path
@@ -1218,6 +1322,7 @@ impl eframe::App for BenzaitenApp {
                 });
             });
 
+        // --- 下部タイムラインパネル ---
         let timeline_position = self
             .player
             .as_ref()
@@ -1278,6 +1383,7 @@ impl eframe::App for BenzaitenApp {
             });
         self.handle_timeline_actions(timeline_actions, timeline_duration);
 
+        // --- 左ペイン：音声選択、原文・カタカナ入力 ---
         let mut original_input_changed = false;
         let mut reading_input_changed = false;
         egui::SidePanel::left("lyrics-input-panel")
@@ -1297,9 +1403,9 @@ impl eframe::App for BenzaitenApp {
                 ui.separator();
                 ui.strong("原文歌詞");
                 ui.small("Forced Alignmentで使用する正解歌詞を入力します");
-                // Fix the box's height and scroll long lyrics inside it,
-                // instead of letting the TextEdit grow and push the katakana
-                // box (and everything below it) out of view.
+                // 入力欄の高さを固定し、長い歌詞は内部でスクロールさせる。
+                // TextEditが伸び続けてカタカナ欄（とその下）を画面外へ
+                // 押し出してしまわないようにするため。
                 let original_area_height = ui.available_height() * 0.55;
                 original_input_changed = egui::ScrollArea::vertical()
                     .id_salt("original-lyrics-scroll")
@@ -1343,6 +1449,7 @@ impl eframe::App for BenzaitenApp {
             .as_ref()
             .and_then(|player| active_lyric_index(&self.project.lyrics, player.position_ms()));
         let right_scroll = self.auto_scroll && active_index != self.last_highlighted;
+        // --- 右ペイン：アートワーク・曲情報・歌詞位置リスト ---
         egui::SidePanel::right("player-panel")
             .default_width(360.0)
             .min_width(260.0)
@@ -1405,10 +1512,12 @@ impl eframe::App for BenzaitenApp {
                 });
             });
         self.last_highlighted = active_index;
+        // --- 中央パネル：曲情報、歌詞表示切替、時刻補正、自動同期、
+        //     下部固定の再生バー ---
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Reserve the playback bar's space at the bottom of the central
-            // area first so its position stays fixed no matter how tall the
-            // scrollable content above it grows (e.g. a long lyric line).
+            // 再生バーの領域を先に中央エリア下部へ確保しておくことで、
+            // 上のスクロール可能な部分がどれだけ縦に伸びても
+            // （長い歌詞行など）、再生バーの位置は常に固定される。
             egui::TopBottomPanel::bottom("central-playback-bar")
                 .show_separator_line(false)
                 .show_inside(ui, |ui| {
@@ -1455,9 +1564,9 @@ impl eframe::App for BenzaitenApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.heading(if self.dirty {
-                        "弁才天 *"
+                        "Benzaiten *"
                     } else {
-                        "弁才天"
+                        "Benzaiten"
                     });
                     let mut metadata_changed = false;
                     egui::CollapsingHeader::new("音楽情報・アルバムアート")
@@ -1596,6 +1705,10 @@ impl eframe::App for BenzaitenApp {
                     let mut seek_selected = false;
                     let mut navigate_to = None;
                     let mut reading_edit = None;
+                    // 「現在の歌詞・時刻補正」パネル。選択中の行のカタカナ・
+                    // 開始時刻・調整幅などをまとめて表示・編集する。各操作は
+                    // いったんローカル変数（`set_to`/`shift_by`など）へ集約し、
+                    // パネルを閉じた後にまとめて`project.lyrics`へ反映する。
                     egui::Frame::group(ui.style())
                         .fill(egui::Color32::from_rgb(29, 34, 42))
                         .inner_margin(16.0)
@@ -1736,6 +1849,9 @@ impl eframe::App for BenzaitenApp {
                         }
                     }
 
+                    // Ctrl+←/→ = 10ms、Ctrl+Shift+←/→ = 100msで選択行を
+                    // 微調整する。テキスト入力中（`wants_keyboard_input`）は
+                    // 矢印キーが文字移動に使われるべきなので無効化する。
                     if selected.is_some() && !ctx.wants_keyboard_input() {
                         let keyboard_delta = ctx.input(|input| {
                             if !input.modifiers.ctrl {
@@ -1793,6 +1909,11 @@ impl eframe::App for BenzaitenApp {
                         self.changed();
                         self.sync_lyric_inputs_from_project();
                     }
+                    // 「自動同期」ボタン：歌詞言語を解決し、対応するモデル・
+                    // 語彙の設定を検証した上で、Forced Alignmentパイプライン
+                    // を非同期ジョブとして開始する。開始時点の`generation`を
+                    // `job_generation`に記録しておき、完了時に入力が変わって
+                    // いないか確認できるようにする（`poll_job`参照）。
                     ui.horizontal(|ui| {
                         if self.job.is_some() {
                             if ui.button("同期をキャンセル").clicked() {

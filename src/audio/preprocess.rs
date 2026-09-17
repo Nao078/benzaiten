@@ -1,9 +1,15 @@
+//! Forced Alignmentが要求する固定フォーマットへの、ffmpegによる変換処理。
+
 use std::{
     path::Path,
     sync::{atomic::AtomicBool, Arc},
 };
 
-/// Convert an input file to the 16 kHz mono PCM WAV expected by Wav2Vec2.
+/// 入力ファイルを、Wav2Vec2が期待する16kHzモノラルPCM WAVへ変換する。
+///
+/// `-y`は`output`を無条件に上書きし、`-vn`は映像・アートワークの
+/// ストリームを除外する（ffmpegがカバーアート画像トラックまで
+/// 変換しようとしないようにするため）。
 pub fn to_pcm16_mono_16khz(
     ffmpeg: &Path,
     input: &Path,

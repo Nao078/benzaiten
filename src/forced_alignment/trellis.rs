@@ -1,3 +1,7 @@
+//! CTC（Connectionist Temporal Classification）のトレリス上でViterbi
+//! アルゴリズムを実行し、正解トークン列を音響フレームへ強制的に整列させる。
+
+/// 1トークンに割り当てられたフレーム区間と、その区間内での平均確信度。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TokenSpan {
     pub start_frame: usize,
@@ -5,10 +9,22 @@ pub struct TokenSpan {
     pub confidence: f32,
 }
 
+/// トレースバッファ（`frame数 × state数`）の上限。極端に長い音声・歌詞の
+/// 組み合わせでメモリを使い果たさないための安全弁。
 const MAX_TRACE_CELLS: usize = 64_000_000;
 
-/// Viterbi alignment over the standard CTC topology:
-/// blank, token, blank, token, ... .
+/// 標準的なCTCのトポロジ（blank, token, blank, token, ..., blank）に
+/// 沿ったViterbiアラインメント。
+///
+/// 状態数は`2 * トークン数 + 1`で、偶数番目の状態がblank、奇数番目の
+/// 状態が`tokens[state / 2]`に対応する。各フレームで取りうる遷移は
+/// 「留まる」「1つ先の状態へ進む」「2つ先の状態へジャンプ（直前と
+/// 異なるトークン同士の間のblankを飛ばす）」の3通りで、これは同じ
+/// トークンが連続する場合にblankを挟まないと区別できないというCTCの
+/// 制約に対応している。各フレームで最も対数尤度の高い経路を
+/// 動的計画法で求め、`trace`にどの遷移を選んだかを記録しておいて
+/// 最後に終端から先頭へ逆向きにたどることでトークンごとのフレーム
+/// 区間を復元する。
 pub fn force_align(
     emissions: &[Vec<f32>],
     tokens: &[usize],
@@ -43,6 +59,10 @@ pub fn force_align(
         return Err("audio has fewer acoustic frames than transcript tokens".to_owned());
     }
 
+    // `previous`/`current`は各状態までの最良経路の対数尤度（フレームごとに
+    // ローリングして更新）。`trace`は各(フレーム, 状態)セルでどの遷移
+    // （0=留まる、1=1つ進む、2=2つジャンプ）を選んだかを記録し、
+    // 後で経路を逆にたどるために使う。
     let negative_infinity = f32::NEG_INFINITY;
     let mut previous = vec![negative_infinity; states];
     let mut current = vec![negative_infinity; states];
@@ -61,6 +81,8 @@ pub fn force_align(
                 best = previous[state - 1];
                 predecessor = 1;
             }
+            // 2つ先へのジャンプは、間のblankを省略できる場合
+            // （直前のトークンと今のトークンが異なる場合）のみ許可する。
             if state >= 2
                 && state % 2 == 1
                 && tokens[state / 2] != tokens[state / 2 - 1]
@@ -77,6 +99,8 @@ pub fn force_align(
         std::mem::swap(&mut previous, &mut current);
     }
 
+    // 終端は「最後のトークン状態」か「その後のblank」のどちらでもよいので、
+    // 尤度の高い方を選ぶ。
     let last_token_state = states - 2;
     let mut state = if previous[states - 1] > previous[last_token_state] {
         states - 1
@@ -87,6 +111,9 @@ pub fn force_align(
         return Err("could not find a CTC path through the complete lyrics".to_owned());
     }
 
+    // 記録しておいた`trace`を終端から先頭へたどりながら、奇数状態
+    // （＝トークン状態）を通過するたびにそのトークンの開始・終了フレームを
+    // 更新し、確信度（そのフレームでの正規化済み事後確率）を積算する。
     let mut starts = vec![usize::MAX; tokens.len()];
     let mut ends = vec![0; tokens.len()];
     let mut confidence_sum = vec![0.0_f32; tokens.len()];
@@ -123,6 +150,8 @@ pub fn force_align(
         .collect()
 }
 
+/// トレリスの状態番号から、その状態が表すラベル（blankかトークンID）を
+/// 求める。偶数状態はblank、奇数状態は`tokens[state / 2]`。
 fn state_label(state: usize, tokens: &[usize], blank: usize) -> usize {
     if state.is_multiple_of(2) {
         blank
@@ -131,6 +160,8 @@ fn state_label(state: usize, tokens: &[usize], blank: usize) -> usize {
     }
 }
 
+/// 数値的に安定な形でのlogsumexp。フレームのlogitsをソフトマックス
+/// 正規化する際の対数正規化定数（分配関数の対数）を求めるために使う。
 fn log_sum_exp(values: &[f32]) -> f32 {
     let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     maximum
@@ -147,7 +178,7 @@ mod tests {
 
     #[test]
     fn aligns_repeated_tokens_through_a_blank() {
-        // blank=0, A=1; the only strong path is A, blank, A.
+        // blank=0, A=1。強い経路は「A, blank, A」のみ。
         let emissions = vec![
             vec![0.0, 8.0],
             vec![8.0, 0.0],

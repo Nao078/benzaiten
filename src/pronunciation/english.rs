@@ -1,14 +1,19 @@
-//! Context-aware US-English pronunciation for singing practice guides.
+//! 歌唱練習ガイド用の、文脈を考慮した米語発音処理。
 
 use std::{collections::HashMap, sync::OnceLock};
 
 use super::{katakana, phoneme::Phoneme, PronunciationEngine, PronunciationResult};
 
+/// 同梱のCMU英語発音辞書（固定コミット、詳細はREADME参照）。
 const CMUDICT: &str = include_str!("../../assets/cmudict/cmudict.dict");
 
+/// CMUdict＋弱形・連結規則にもとづく英語発音エンジン。状態を持たないため
+/// ゼロサイズのマーカー型で、[`dictionary`]内部の静的辞書を共有する。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EnglishPronunciationEngine;
 
+/// 1単語分の発音情報。`link_to_next`は、次の単語と連結発音（フラップ・
+/// yod融合など）の対象になり得るかどうかを表す（句読点の直前ではfalse）。
 #[derive(Debug)]
 struct WordPronunciation {
     word: String,
@@ -16,6 +21,8 @@ struct WordPronunciation {
     link_to_next: bool,
 }
 
+/// トークン化直後の単語（辞書引き前）。構造は[`WordPronunciation`]と同じ
+/// 役割の`link_to_next`を持つが、まだ発音情報がない点が異なる。
 #[derive(Debug)]
 struct WordToken {
     word: String,
@@ -34,6 +41,8 @@ impl PronunciationEngine for EnglishPronunciationEngine {
         }
         let dictionary = dictionary();
         let mut unknown_words = Vec::new();
+        // 辞書にある単語はその音素列を、辞書に無い単語（固有名詞など）は
+        // フォールバック（綴り読み）を使い、未知語として記録しておく。
         let mut pronunciations: Vec<WordPronunciation> = words
             .into_iter()
             .map(|token| {
@@ -54,6 +63,8 @@ impl PronunciationEngine for EnglishPronunciationEngine {
         apply_weak_forms(&mut pronunciations);
         apply_connected_speech(&mut pronunciations);
 
+        // 単語境界には`|`マーカーを挟んでおき、カタカナ変換側が単語の
+        // 切れ目を認識できるようにする。
         let mut phonemes = Vec::new();
         for (index, word) in pronunciations.into_iter().enumerate() {
             if index > 0 {
@@ -70,6 +81,8 @@ impl PronunciationEngine for EnglishPronunciationEngine {
     }
 }
 
+/// CMUdictをパースした単語→ARPAbet音素列の辞書。初回アクセス時に一度だけ
+/// 構築し、以降は使い回す（`OnceLock`によるプロセス内キャッシュ）。
 fn dictionary() -> &'static HashMap<&'static str, Vec<String>> {
     static DICTIONARY: OnceLock<HashMap<&'static str, Vec<String>>> = OnceLock::new();
     DICTIONARY.get_or_init(|| {
@@ -78,6 +91,8 @@ fn dictionary() -> &'static HashMap<&'static str, Vec<String>> {
             let Some((entry, pronunciation)) = line.split_once(' ') else {
                 continue;
             };
+            // `WORD(1)`のような異形（第2発音以降）と重複エントリは無視し、
+            // 各単語の最初（＝最も一般的）の発音だけを採用する。
             if entry.ends_with(')') || entries.contains_key(entry) {
                 continue;
             }
@@ -93,6 +108,9 @@ fn dictionary() -> &'static HashMap<&'static str, Vec<String>> {
     })
 }
 
+/// 原文を英単語トークンへ分割する。アポストロフィは単語の内側でのみ
+/// 許容し（`don't`など）、句読点の直前の単語は`link_to_next = false`にして
+/// 連結発音の対象から外す。
 fn tokenize(input: &str) -> Vec<WordToken> {
     let normalized = input.replace(['’', '‘'], "'").to_ascii_lowercase();
     let mut words = Vec::new();
@@ -128,6 +146,11 @@ fn tokenize(input: &str) -> Vec<WordToken> {
     words
 }
 
+/// 機能語（冠詞・前置詞など）を、辞書の強形ではなく実際の発話でよく
+/// 使われる弱形の音素列へ置き換える（例："a"→強形"EY1"ではなく弱形
+/// "AH0"、"the"は次が母音始まりかどうかで読みが変わる）。歌詞テキストの
+/// `link_to_next`情報だけで判定するため完全ではないが、素の辞書読みより
+/// 自然な歌唱ガイドになる。
 fn apply_weak_forms(words: &mut [WordPronunciation]) {
     for index in 0..words.len() {
         let next_starts_with_vowel = words
@@ -151,6 +174,9 @@ fn apply_weak_forms(words: &mut [WordPronunciation]) {
                 .map(|phone| (*phone).to_owned())
                 .collect();
         }
+        // "our/their/your lives"のような所有格の後の"lives"は
+        // 名詞（人生・複数形、/laɪvz/）として読む特例。
+        // （動詞"live"の三人称単数形/lɪvz/と発音が異なるため）
         if words[index].word == "lives"
             && index > 0
             && matches!(words[index - 1].word.as_str(), "our" | "their" | "your")
@@ -163,6 +189,12 @@ fn apply_weak_forms(words: &mut [WordPronunciation]) {
     }
 }
 
+/// 単語をまたぐ連結発音（フラップ化・yod融合）を音素列へ反映する。
+/// 対象は`link_to_next`な（＝句読点で区切られていない）隣接語のみ。
+///
+/// - "T"/"D" + "Y"（例："got you"）→ "CH"/"JH"へ融合（yod coalescence）。
+/// - 母音に挟まれた"T"/"D"（前の単語末が母音、次の単語頭も母音）→
+///   アメリカ英語の弾き音"DX"に置き換える（例："get it"→ ゲリ）。
 fn apply_connected_speech(words: &mut [WordPronunciation]) {
     for index in 0..words.len().saturating_sub(1) {
         if !words[index].link_to_next {
@@ -198,6 +230,10 @@ fn is_vowel(phone: &str) -> bool {
     Phoneme::new(phone).is_vowel()
 }
 
+/// CMUdictに無い単語（固有名詞・造語など）向けのフォールバック発音。
+/// 各アルファベットを「その文字名の読み」（B→ビー、など）に変換して
+/// 綴り読みにする。近似でしかないため、生成後にGUI上で未知語として
+/// 通知しユーザーに確認してもらう前提。
 fn fallback_pronunciation(word: &str) -> Vec<String> {
     let mut phones = Vec::new();
     for character in word.chars().filter(char::is_ascii_alphabetic) {

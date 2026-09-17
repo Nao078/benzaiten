@@ -1,12 +1,14 @@
+//! 自由入力の歌詞・読みテキストを[`LyricLine`]へ変換する処理。
+//! テキストの出所（GUIへの貼り付けか、ファイル読み込みか）には依存しない。
+
 pub use super::project::{LyricLine, ReadingSource, TimestampSource};
 
-/// Parses the editable lyric text into lyric lines.
+/// 編集用の歌詞テキストを歌詞行の配列へパースする。
 ///
-/// A UTF-8 BOM is tolerated at the very beginning of the input and CRLF input
-/// is represented with the same text as LF input. Blank rows (used only for
-/// readability while pasting or editing, e.g. stanza breaks) are dropped
-/// rather than becoming empty lyric lines, so every remaining line is a real
-/// alignment target and ids stay compact (0, 1, 2, ...).
+/// 先頭のUTF-8 BOMは許容し、CRLFはLFと同じテキストとして扱う。
+/// 空行（貼り付け・編集時の見やすさのため、段落区切りなどに使われる）は
+/// 空の歌詞行にはせず破棄する。これにより、残る行はすべて実際の
+/// アライメント対象となり、idも詰めた値（0, 1, 2, ...）になる。
 pub fn parse_lyrics(input: &str) -> Vec<LyricLine> {
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
 
@@ -28,8 +30,18 @@ pub fn parse_lyrics(input: &str) -> Vec<LyricLine> {
         .collect()
 }
 
-/// Applies an optional, user-supplied pronunciation file without changing the
-/// canonical lyrics. Blank stanza rows may either be present or omitted.
+/// ユーザーが用意した任意の発音ファイルを適用する。正本の歌詞テキストは
+/// 変更せず、`reading_text`/`reading_source`のみを書き換える。
+///
+/// 読みファイルの行に対して、以下の2通りの対応付けを順に試す。
+/// 1. `lyrics`の行数（渡された配列そのまま）と完全一致する場合の位置対応。
+///    呼び出し側が直接構築した空の`original_text`行も含めて対応させる
+///    （`parse_lyrics`自体はもう空行を生成しないが、読みファイル側に
+///    空の段落区切り行があり、それが1:1で並んでいるケースにはまだ対応する）。
+/// 2. 上記が一致しない場合、両側とも空行を除いた行数で対応付けるフォールバック。
+///    これにより、空の区切り行を省略した読みファイルでも正しく対応する。
+///
+/// 読みが設定できた行数を返す。どちらの方式でも行数が一致しない場合はエラー。
 pub fn apply_readings(lyrics: &mut [LyricLine], input: &str) -> Result<usize, String> {
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let mut rows: Vec<String> = input
@@ -46,10 +58,13 @@ pub fn apply_readings(lyrics: &mut [LyricLine], input: &str) -> Result<usize, St
     }
 
     if rows.len() == lyric_len {
+        // 方式1: 空行も含めた位置対応。
         for (line, reading) in lyrics.iter_mut().zip(rows) {
             set_reading(line, reading);
         }
     } else {
+        // 方式2: 両側とも空行を除いた行同士を対応させる。
+        // 歌詞側の空行の読みは常にクリアする。
         let non_empty_rows: Vec<String> = rows.into_iter().filter(|row| !row.is_empty()).collect();
         let non_empty_lyrics = lyrics
             .iter()
@@ -77,6 +92,8 @@ pub fn apply_readings(lyrics: &mut [LyricLine], input: &str) -> Result<usize, St
         .count())
 }
 
+/// 1行分の読みを設定またはクリアする。ユーザー入力のテキストなので、
+/// 空でない読みには[`ReadingSource::Manual`]を付与する。
 fn set_reading(line: &mut LyricLine, reading: String) {
     if reading.is_empty() {
         line.reading_text = None;
@@ -91,8 +108,8 @@ fn set_reading(line: &mut LyricLine, reading: String) {
 mod tests {
     use super::{apply_readings, parse_lyrics, LyricLine, ReadingSource};
 
-    /// Builds lyric lines directly (bypassing `parse_lyrics`, which drops
-    /// blank rows) so blank-row handling in `apply_readings` stays covered.
+    /// `parse_lyrics`（空行を破棄する）を経由せず、歌詞行を直接組み立てる。
+    /// これにより`apply_readings`の空行対応ロジックのテストを維持する。
     fn lines(rows: &[&str]) -> Vec<LyricLine> {
         rows.iter()
             .enumerate()
