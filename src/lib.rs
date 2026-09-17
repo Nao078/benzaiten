@@ -1,0 +1,11 @@
+pub mod app;
+pub mod audio;
+pub mod domain;
+pub mod forced_alignment;
+pub mod jobs;
+pub mod lrc;
+pub mod metadata;
+pub mod process;
+pub mod project;
+pub mod pronunciation;
+pub mod ui;

@@ -1,0 +1,33 @@
+[package]
+name = "benzaiten"
+version = "0.1.0"
+edition = "2021"
+description = "Local desktop lyrics alignment and LRC editor"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+hound = "3.5"
+unicode-normalization = "0.1"
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+rodio = "0.21.1"
+rfd = "0.15"
+lofty = "=0.25.2"
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+
+# `ort` の配布済みバイナリは MSVC 向けのみなので、同梱の GNU 版 Rustで
+# Windowsビルドするときは onnxruntime.dll を実行時に読み込む。
+[target.'cfg(all(target_os = "windows", target_env = "gnu"))'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-25"] }
+
+[target.'cfg(not(all(target_os = "windows", target_env = "gnu")))'.dependencies]
+ort = { version = "=2.0.0-rc.13" }
+
+[[bin]]
+name = "benzaiten"
+path = "src/main.rs"
+
+[[bin]]
+name = "benzaiten-cli"
+path = "src/bin/benzaiten-cli.rs"
