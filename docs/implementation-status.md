@@ -5,7 +5,7 @@
 | T01 | 設計済み | 入出力と検証方針を `.tmp/v0.1-implementation-plan.md` に整理済み。 |
 | T02 | 実装済み | domain DTO、モジュール構成、エラー文字列を用意。 |
 | T03 | 実装済み | UTF-8 歌詞解析、Project JSON の保存・読込、相対音声パス解決。 |
-| T04 | 実装済み | ffmpeg による 16 kHz mono PCM16 WAV 前処理。 |
+| T04 | 実装済み | ffmpeg による 16 kHz mono PCM16 WAV 前処理（T23で純Rust実装へ置換）。 |
 | T05 | 削除済み | whisper.cpp転写経路。Forced Alignment移行後、未使用コードと配布物を削除。 |
 | T06 | 実装済み | 英語正解歌詞のCTCトークン化。 |
 | T07 | 実装済み | ONNX Wav2Vec2推論とCTC Viterbi Forced Alignment。 |
@@ -23,18 +23,19 @@
 | T19 | 実装済み | Auto/en/jp言語切替、日本語文字検出、外部tokenizer語彙、日本語Wav2Vec2 Forced Alignment。 |
 | T20 | 実装済み | 常設メニューバーと保存ショートカット、原文・カタカナ2トラックのドラッグ編集タイムライン、Ctrl+ホイール拡大縮小。 |
 | T21 | 実装済み | 左ペインを音声・原文・カタカナ入力へ変更し、中央一覧を現在行に集中した可変ms時刻補正UIへ変更。 |
-| T22 | 実装済み | タイムラインの左右端ドラッグによる開始・終了個別調整、再生位置追従、右クリックでの追従移動トグルなど編集UXの改善。歌詞テキストの空行破棄。音声タグ書込みをメニューの`MP3 + LRC`/`FLAC`/`M4A`サブメニューへ再編し、FLAC/M4Aへの同期歌詞埋め込み（`ItemKey::Lyrics`）とMP3の`.lrc`併用出力を追加。可逆音源（WAV/FLAC）読み込み時はffmpeg経由で他形式へ変換してから書き込む機能も追加（非可逆音源からの変換は二重圧縮を避けるため提供しない）。 |
+| T22 | 実装済み | タイムラインの左右端ドラッグによる開始・終了個別調整、再生位置追従、右クリックでの追従移動トグルなど編集UXの改善。歌詞テキストの空行破棄。音声タグ書込みをメニューの`MP3 + LRC`/`FLAC`/`M4A`サブメニューへ再編し、FLAC/M4Aへの同期歌詞埋め込み（`ItemKey::Lyrics`）とMP3の`.lrc`併用出力を追加。可逆音源（WAV/FLAC）読み込み時は他形式へ変換してから書き込む機能も追加（非可逆音源からの変換は二重圧縮を避けるため提供しない）。 |
+| T23 | 実装済み | 外部ffmpegバイナリへの依存を排除。前処理を`Symphonia`（デコード）＋`rubato`（16kHzリサンプリング）による純Rust実装へ置換し、`ToolSettings`/CLI引数からffmpegパスを削除。可逆音源からのタグ埋め込み用変換もFLACは`flacenc`、MP3はLAME（`mp3lame-encoder`、LGPL）による純Rust/軽量バインディング実装へ置換。M4A（AAC）への変換のみ実用的な純Rustエンコーダが無く未対応（メニュー上で無効化、既存M4A音声への直接タグ埋め込みは可能）。汎用サブプロセス実行モジュール（`src/process.rs`）は用途が無くなったため削除。 |
 
 ## 検証環境
 
 Windows のローカル検証は Rust GNU クロスビルドで実施しました。GNUビルドではONNX Runtime 1.25.1をDLLとして動的ロードします。通常の開発環境には Rust の MSVC ツールチェーンと Visual Studio Build Tools（Windows SDK を含む）を推奨します。
 
-- Windows向け `cargo test`: 36件成功。
+- Windows向け `cargo test`: 35件成功。
 - Windows向け `cargo clippy --all-targets -- -D warnings`: 成功。
 - `cargo fmt --all -- --check`: 成功。
 - GUI実行ファイルを起動し、ウィンドウ生成と起動時エラーがないことを確認。
 - 日本語ONNXモデルと2341語彙tokenizerを実ロードし、Windows上で推論・Forced Alignment・LRC出力を通し確認。
-- Linux/WSLで実ffmpeg、ONNX Runtime、Wav2Vec2、CTC、LRCまで通し検証済み。
+- Windows実機（クロスビルド、WSL2 Interop経由で実プロセスとして実行）で、ffmpeg抜きの新前処理パイプライン（Symphonia＋rubato）を含めONNX Runtime、Wav2Vec2、CTC、LRCまで通し検証済み。FLAC/MP3再エンコード（`flacenc`/LAME）も実音声で往復デコード確認済み。
 - Windows向けCI設定を追加。リモートCIは未実行。
 
 `.tmp` はサンプル・作業用でGit管理対象外です。他のPCでは通常のRust開発環境を用意してください。

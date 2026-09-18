@@ -73,14 +73,14 @@ impl AudioTagFormat {
         }
     }
 
-    /// 可逆音源からこの形式へ変換するときだけ使うffmpegコーデック引数。
-    /// 1回限りの非可逆エンコードとなるため、十分な品質・ビットレートを
-    /// 指定している。
-    fn ffmpeg_codec_args(self) -> &'static [&'static str] {
+    /// 可逆音源からの変換（[`convert_audio`](crate::audio::convert)）に
+    /// 対応しているかどうか。M4A（AAC）エンコードは純Rustの実用的な
+    /// エンコーダが無く、Windows Media Foundation連携は別タスクとして
+    /// 後回しにしているため、現時点では未対応。
+    fn supports_lossless_conversion(self) -> bool {
         match self {
-            AudioTagFormat::Mp3WithLrc => &["-c:a", "libmp3lame", "-q:a", "2"],
-            AudioTagFormat::Flac => &["-c:a", "flac"],
-            AudioTagFormat::M4a => &["-c:a", "aac", "-b:a", "256k"],
+            AudioTagFormat::Mp3WithLrc | AudioTagFormat::Flac => true,
+            AudioTagFormat::M4a => false,
         }
     }
 }
@@ -114,7 +114,6 @@ use eframe::egui;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
 
@@ -221,7 +220,6 @@ pub struct BenzaitenApp {
     /// なので、結果を古いものとして破棄する（`poll_job`参照）。
     job_generation: u64,
     status: String,
-    ffmpeg: String,
     model: String,
     japanese_model: String,
     japanese_vocabulary: String,
@@ -256,7 +254,7 @@ pub struct BenzaitenApp {
 
 impl BenzaitenApp {
     /// eframeのウィンドウ生成時に一度だけ呼ばれる初期化処理。日本語フォント
-    /// の探索と、外部ツール（ffmpeg・モデル・語彙）の既定パス解決を行う。
+    /// の探索と、外部ツール（モデル・語彙）の既定パス解決を行う。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut fonts = egui::FontDefinitions::default();
         // 独自の日本語フォントを同梱・再配布せず、OSに入っている
@@ -290,12 +288,6 @@ impl BenzaitenApp {
             "models/wav2vec2-large-xlsr-53-japanese-tokenizer.json",
         ))
         .unwrap_or_else(|| PathBuf::from("models/wav2vec2-large-xlsr-53-japanese-tokenizer.json"));
-        let ffmpeg = if cfg!(windows) {
-            find_project_file(Path::new("ffmpeg/bin/ffmpeg.exe"))
-                .unwrap_or_else(|| PathBuf::from("ffmpeg.exe"))
-        } else {
-            PathBuf::from("ffmpeg")
-        };
         Self {
             project: Project::default(),
             player: None,
@@ -306,7 +298,6 @@ impl BenzaitenApp {
             generation: 0,
             job_generation: 0,
             status: "音声と歌詞を開いてください".into(),
-            ffmpeg: ffmpeg.to_string_lossy().into_owned(),
             model: model.to_string_lossy().into_owned(),
             japanese_model: japanese_model.to_string_lossy().into_owned(),
             japanese_vocabulary: japanese_vocabulary.to_string_lossy().into_owned(),
@@ -539,10 +530,10 @@ impl BenzaitenApp {
         }
     }
 
-    /// 「外部ツール設定」ダイアログの中身：歌詞言語の選択、ffmpeg・各種
-    /// モデルのパス設定、CPUスレッド数、配布元へのリンク。
+    /// 「外部ツール設定」ダイアログの中身：歌詞言語の選択、各種モデルの
+    /// パス設定、CPUスレッド数、配布元へのリンク。
     fn show_external_tools_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label("自動同期にはffmpegと選択言語のWav2Vec2 ONNXモデルが必要です。");
+        ui.label("自動同期には選択言語のWav2Vec2 ONNXモデルが必要です。");
         let detected = crate::forced_alignment::tokenizer::detect_language(&self.project.lyrics);
         ui.horizontal(|ui| {
             ui.label("歌詞言語");
@@ -562,7 +553,6 @@ impl BenzaitenApp {
             }
         });
         for (label, value) in [
-            ("ffmpeg", &mut self.ffmpeg),
             ("英語ONNX", &mut self.model),
             ("日本語ONNX", &mut self.japanese_model),
             ("日本語tokenizer", &mut self.japanese_vocabulary),
@@ -941,10 +931,11 @@ impl BenzaitenApp {
         }
     }
 
-    /// 現在の音声をffmpegで`format`へ変換し、元ファイルはそのまま残して
-    /// 同じ場所に新しいファイルを作成し、そのパスを返す。可逆音源に対して
-    /// のみ呼ばれる想定なので、対象が非可逆形式でも1回限りのエンコードで
-    /// 済み、非可逆圧縮が重なることはない。
+    /// 現在の音声を`format`へ変換し（`crate::audio::convert`、外部プロセス
+    /// なしの純Rust実装）、元ファイルはそのまま残して同じ場所に新しい
+    /// ファイルを作成し、そのパスを返す。可逆音源に対してのみ呼ばれる
+    /// 想定なので、対象が非可逆形式でも1回限りのエンコードで済み、
+    /// 非可逆圧縮が重なることはない。
     fn convert_audio_for_tag_format(&self, format: AudioTagFormat) -> Result<PathBuf, String> {
         let target_path = self.project.audio_path.with_extension(format.extension());
         if target_path.exists() {
@@ -953,16 +944,23 @@ impl BenzaitenApp {
                 target_path.display()
             ));
         }
-        let ffmpeg = PathBuf::from(&self.ffmpeg);
-        let mut arguments: Vec<&Path> =
-            vec![Path::new("-y"), Path::new("-i"), &self.project.audio_path];
-        arguments.extend(format.ffmpeg_codec_args().iter().map(Path::new));
-        arguments.push(&target_path);
-        crate::process::run(&ffmpeg, &arguments, Arc::new(AtomicBool::new(false)))
-            .map(|_| target_path)
+        match format {
+            AudioTagFormat::Flac => {
+                crate::audio::convert::to_flac(&self.project.audio_path, &target_path)?;
+            }
+            AudioTagFormat::Mp3WithLrc => {
+                crate::audio::convert::to_mp3(&self.project.audio_path, &target_path)?;
+            }
+            AudioTagFormat::M4a => {
+                return Err(
+                    "M4Aへの変換は現在未対応です（今後のアップデートで対応予定）".to_owned(),
+                );
+            }
+        }
+        Ok(target_path)
     }
 
-    /// 実際にタグを書き込む。必要なら先にffmpeg変換を行い、その後
+    /// 実際にタグを書き込む。必要なら先に音声変換を行い、その後
     /// タグ・（対応形式なら）歌詞の埋め込み、（MP3なら）`.lrc`出力を行う。
     fn write_audio_tags(&mut self, format: AudioTagFormat) {
         // 最初に一度だけレンダリングし、歌詞が出力可能な状態でない
@@ -1237,7 +1235,10 @@ impl eframe::App for BenzaitenApp {
                             ("FLAC", AudioTagFormat::Flac),
                             ("M4A", AudioTagFormat::M4a),
                         ] {
-                            let enabled = detected == Some(format) || lossless_source;
+                            // M4A（AAC）への変換は未対応（別タスク）なので、
+                            // 既にM4Aの音声を読み込んでいる場合のみ有効にする。
+                            let enabled = detected == Some(format)
+                                || (lossless_source && format.supports_lossless_conversion());
                             if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                                 command = Some(AppCommand::WriteAudioTags(format));
                             }
@@ -1941,7 +1942,6 @@ impl eframe::App for BenzaitenApp {
                             let japanese = language
                                 == crate::forced_alignment::tokenizer::AlignmentLanguage::Japanese;
                             let settings = ToolSettings {
-                                ffmpeg: self.ffmpeg.clone().into(),
                                 model: if japanese {
                                     self.japanese_model.clone().into()
                                 } else {

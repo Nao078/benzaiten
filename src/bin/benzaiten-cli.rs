@@ -16,9 +16,9 @@ use std::path::PathBuf;
 /// 引数解析からLRC/プロジェクトJSON出力までの一連の処理。
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() < 5 {
+    if args.len() < 4 {
         return Err(
-            "Usage: benzaiten-cli <audio> <lyrics.txt> <ffmpeg> <wav2vec2.onnx> <output.lrc> [--language auto|en|jp] [--vocabulary <tokenizer.json>] [--generate-reading | --reading <katakana.txt>]"
+            "Usage: benzaiten-cli <audio> <lyrics.txt> <wav2vec2.onnx> <output.lrc> [--language auto|en|jp] [--vocabulary <tokenizer.json>] [--generate-reading | --reading <katakana.txt>]"
                 .into(),
         );
     }
@@ -26,8 +26,8 @@ fn run() -> Result<(), String> {
     let mut vocabulary = None;
     let mut reading_path = None;
     let mut generate_reading = false;
-    // 位置引数（5個）の後ろに続く任意のオプションを解析する。
-    let mut index = 5;
+    // 位置引数（4個）の後ろに続く任意のオプションを解析する。
+    let mut index = 4;
     while index < args.len() {
         match args[index].to_string_lossy().as_ref() {
             "--language" if index + 1 < args.len() => {
@@ -55,8 +55,7 @@ fn run() -> Result<(), String> {
     let audio = std::fs::canonicalize(&args[0]).map_err(|e| e.to_string())?;
     let text = std::fs::read_to_string(&args[1]).map_err(|e| e.to_string())?;
     let settings = ToolSettings {
-        ffmpeg: args[2].clone().into(),
-        model: args[3].clone().into(),
+        model: args[2].clone().into(),
         vocabulary,
         language,
         threads: 8,
@@ -91,7 +90,7 @@ fn run() -> Result<(), String> {
         lyrics,
         ..Default::default()
     };
-    let output = PathBuf::from(&args[4]);
+    let output = PathBuf::from(&args[3]);
     // 未解決の行（時刻が付かなかった行）が残っていても、LRC出力が
     // 失敗した場合に手動補正できるよう、先にプロジェクトJSONを保存しておく。
     storage::save(&output.with_extension("json"), &project)?;

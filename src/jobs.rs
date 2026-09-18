@@ -1,4 +1,4 @@
-//! Forced Alignmentパイプライン全体（ffmpeg前処理→ONNX推論→整列）を、
+//! Forced Alignmentパイプライン全体（音声前処理→ONNX推論→整列）を、
 //! GUIからはキャンセル可能な非同期ジョブとして、CLIからは同期関数
 //! として実行できるようにする。
 
@@ -18,7 +18,6 @@ use crate::domain::lyrics::LyricLine;
 /// GUIでは「外部ツール設定」ダイアログの内容がこれになる。
 #[derive(Debug, Clone)]
 pub struct ToolSettings {
-    pub ffmpeg: PathBuf,
     pub model: PathBuf,
     pub vocabulary: Option<PathBuf>,
     pub language: String,
@@ -55,7 +54,6 @@ impl ToolSettings {
 impl Default for ToolSettings {
     fn default() -> Self {
         Self {
-            ffmpeg: PathBuf::from("ffmpeg"),
             model: PathBuf::from("models/wav2vec2-base-960h.onnx"),
             vocabulary: None,
             language: "en".to_owned(),
@@ -142,7 +140,7 @@ pub fn run_sync(
     )
 }
 
-/// パイプライン本体：入力検証 → ffmpeg前処理 → モデル読込 → 音響推論 →
+/// パイプライン本体：入力検証 → 音声前処理 → モデル読込 → 音響推論 →
 /// 言語判定 → Forced Alignment、の順に実行する。各段階の間で
 /// `check_cancelled`を挟み、キャンセルされていれば早期に打ち切る。
 /// `stage`コールバックには各段階の進捗メッセージを渡す（GUIではこれを
@@ -163,12 +161,7 @@ fn run_with_events(
         .map_err(|error| format!("could not create temporary directory: {error}"))?;
     let wav = temporary.path().join("audio-16k-mono.wav");
     stage("音声を変換中");
-    crate::audio::preprocess::to_pcm16_mono_16khz(
-        &settings.ffmpeg,
-        audio,
-        &wav,
-        Arc::clone(&cancel),
-    )?;
+    crate::audio::preprocess::to_pcm16_mono_16khz(audio, &wav, Arc::clone(&cancel))?;
     check_cancelled(&cancel)?;
 
     stage("Forced Alignmentモデルを読み込み中");
@@ -206,17 +199,11 @@ fn run_with_events(
     aligned
 }
 
-/// パイプライン実行前の前提条件（音声ファイル・ffmpeg・モデル・語彙・
-/// スレッド数）を検証する。
+/// パイプライン実行前の前提条件（音声ファイル・モデル・語彙・スレッド数）
+/// を検証する。
 fn validate(audio: &Path, lyrics: &[LyricLine], settings: &ToolSettings) -> Result<(), String> {
     if !audio.is_file() {
         return Err(format!("audio file was not found: {}", audio.display()));
-    }
-    if !crate::process::is_bare_command(&settings.ffmpeg) && !settings.ffmpeg.is_file() {
-        return Err(format!(
-            "ffmpeg executable was not found: {}",
-            settings.ffmpeg.display()
-        ));
     }
     settings.validate_model(lyrics)?;
     if settings.threads == 0 {

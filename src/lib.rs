@@ -7,7 +7,8 @@
 
 /// eframe/eguiによるデスクトップアプリ本体（ウィンドウ、各パネル、操作処理）。
 pub mod app;
-/// 音声再生（rodio）と、ffmpegによる16kHzモノラルWAVへの前処理。
+/// 音声再生（rodio）と、純Rust実装（Symphonia）による16kHzモノラルWAV
+/// への前処理・タグ埋め込み用の再エンコード。
 pub mod audio;
 /// GUIや音響モデルに依存しない、歌詞・プロジェクトのデータ型。
 pub mod domain;
@@ -19,8 +20,6 @@ pub mod jobs;
 pub mod lrc;
 /// loftyを使った音楽タグの読み書き（FLAC/M4Aでは歌詞の埋め込みも行う）。
 pub mod metadata;
-/// 外部コマンドラインツールをキャンセル可能に実行する小さなラッパー。
-pub mod process;
 /// プロジェクトJSONの読み書き、スキーマ移行、相対パス解決。
 pub mod project;
 /// 英語歌詞から歌唱向けカタカナ発音ガイドを生成する処理。

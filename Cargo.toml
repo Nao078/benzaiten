@@ -15,6 +15,14 @@ rodio = "0.21.1"
 rfd = "0.15"
 lofty = "=0.25.2"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+# 音声前処理・変換で使う実装（外部ffmpegバイナリへの依存を排除するため）。
+# デコードは純Rust（Symphonia）、FLACエンコードも純Rust（flacenc）。
+# MP3エンコードはLAME（LGPL、GPLのffmpegよりはるかに再配布条件が軽い）
+# へのバインディングを使う。
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "ogg", "vorbis", "flac", "wav"] }
+rubato = "0.16"
+flacenc = "0.5"
+mp3lame-encoder = "0.2"
 
 # `ort` の配布済みバイナリは MSVC 向けのみなので、同梱の GNU 版 Rustで
 # Windowsビルドするときは onnxruntime.dll を実行時に読み込む。

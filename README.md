@@ -1,6 +1,6 @@
 # Benzaiten
 
-ローカル音声と正解歌詞をCTC Forced Alignmentで直接照合し、行ごとの開始時刻を持つLRCを作るRustデスクトップアプリです。MP3/WAVをffmpegで16 kHz mono PCM WAVに変換し、Wav2Vec2 ONNXモデルの音響フレームへ正解歌詞を割り当てます。
+ローカル音声と正解歌詞をCTC Forced Alignmentで直接照合し、行ごとの開始時刻を持つLRCを作るRustデスクトップアプリです。MP3/WAV/FLAC/OGG/M4Aを純Rust実装（Symphonia＋rubato）で16 kHz mono PCM WAVに変換し、Wav2Vec2 ONNXモデルの音響フレームへ正解歌詞を割り当てます。外部のffmpegバイナリには依存しません。
 
 ## 実行
 
@@ -12,9 +12,9 @@ cargo run --bin benzaiten
 
 一般的なCargo構成として、`src/lib.rs` に処理モジュール、`src/main.rs` にGUI起動、`src/bin/` にCLI、`tests/` に統合テスト、`docs/` に設計資料を配置しています。
 
-GUIでは音声・UTF-8歌詞・ffmpeg・Forced Alignmentモデルを選択できます。正解歌詞は必須です。歌詞言語は`Auto / en / jp`から選択でき、Autoはひらがな・カタカナ・漢字を含む歌詞を日本語、それ以外を英語として扱います。外部ツールのパスは現在の起動中だけ保持し、プロジェクトJSONには保存しません。
+GUIでは音声・UTF-8歌詞・Forced Alignmentモデルを選択できます。正解歌詞は必須です。歌詞言語は`Auto / en / jp`から選択でき、Autoはひらがな・カタカナ・漢字を含む歌詞を日本語、それ以外を英語として扱います。外部ツールのパスは現在の起動中だけ保持し、プロジェクトJSONには保存しません。
 
-単曲プレイヤーとして、再生中の歌詞行ハイライト、自動スクロール、歌詞行クリックによるシークに対応しています。音声タグから曲名・アーティスト・アルバム・ジャンル・年・トラック番号・ディスク番号・アルバムアートを読み込み、編集内容はプロジェクトJSONへ保存できます。上部メニューバーの「ファイル」→「音声ファイルへタグを書き込む」から`MP3 + LRC` / `FLAC` / `M4A`を選んだ場合だけ音声ファイルを更新し、初回書込み前に同じ場所へ`.tag-backup`ファイルを作成します。読み込み中の音声がWAV・FLACなど可逆形式の場合は3項目とも選択でき、選んだ形式と一致しない場合はffmpegで変換した新しいファイルを同じ場所に作成してから書き込みます（元ファイルは変更しません）。MP3・M4Aなど非可逆形式を読み込んでいる場合は、二重の非可逆圧縮を避けるため一致する項目のみ選択できます。FLAC・M4Aは同期歌詞（LRC形式のテキスト）をタグへ直接埋め込みます（対応プレイヤーで再生時に同期歌詞を表示可能）。MP3のID3v2には同等の汎用フィールドがないため、従来どおり同じ場所に`.lrc`ファイルを書き出します。
+単曲プレイヤーとして、再生中の歌詞行ハイライト、自動スクロール、歌詞行クリックによるシークに対応しています。音声タグから曲名・アーティスト・アルバム・ジャンル・年・トラック番号・ディスク番号・アルバムアートを読み込み、編集内容はプロジェクトJSONへ保存できます。上部メニューバーの「ファイル」→「音声ファイルへタグを書き込む」から`MP3 + LRC` / `FLAC` / `M4A`を選んだ場合だけ音声ファイルを更新し、初回書込み前に同じ場所へ`.tag-backup`ファイルを作成します。読み込み中の音声がWAV・FLACなど可逆形式の場合はMP3・FLACへ選択できます（純Rustエンコーダ：MP3はLAME、FLACはflacenc）。選んだ形式と一致しない場合は変換した新しいファイルを同じ場所に作成してから書き込みます（元ファイルは変更しません）。MP3・M4Aなど非可逆形式を読み込んでいる場合は、二重の非可逆圧縮を避けるため一致する項目のみ選択できます。M4A（AAC）への変換は現時点では未対応です（今後Windows Media Foundation連携として対応予定）。FLAC・M4Aは同期歌詞（LRC形式のテキスト）をタグへ直接埋め込みます（対応プレイヤーで再生時に同期歌詞を表示可能）。MP3のID3v2には同等の汎用フィールドがないため、従来どおり同じ場所に`.lrc`ファイルを書き出します。
 
 画面は3ペインと下部タイムラインの構成です。左ペインには音声選択、正解歌詞の入力欄、任意のカタカナ歌詞入力欄を配置しています。中央は選択中または再生中の歌詞を大きく表示し、開始時刻、調整幅、前後移動、再生位置の採用、後続行の一括移動を編集します。右はアルバムアート、再生操作、現在歌詞と同期歌詞表示を担当します。Windows Explorerからアプリへファイルをドロップすることもできます。
 
@@ -39,13 +39,13 @@ GNU版Rustでビルドする場合は`runtime\download-onnx-runtime.cmd`を一�
 CLI は次の形式です。
 
 ```powershell
-cargo run --bin benzaiten-cli -- <audio> <lyrics.txt> <ffmpeg> <wav2vec2.onnx> <output.lrc>
+cargo run --bin benzaiten-cli -- <audio> <lyrics.txt> <wav2vec2.onnx> <output.lrc>
 ```
 
 任意のカタカナ歌詞もプロジェクトJSONへ格納する場合は、末尾に`--reading <katakana.txt>`を指定します。
 自動生成する場合は、代わりに`--generate-reading`を指定します。
 
-日本語同期では日本語モデルを第4引数へ渡し、`--language jp --vocabulary models\wav2vec2-large-xlsr-53-japanese-tokenizer.json`を追加します。
+日本語同期では日本語モデルを第3引数へ渡し、`--language jp --vocabulary models\wav2vec2-large-xlsr-53-japanese-tokenizer.json`を追加します。
 
 CLI は LRC を出力する前に `<output>.json` のプロジェクトを保存します。未設定時刻などで LRC 出力に失敗しても、手動補正用の JSON は残ります。
 
@@ -59,6 +59,6 @@ CLI は LRC を出力する前に `<output>.json` のプロジェクトを保存
 
 CMUdictはCarnegie Mellon University Speech Groupの辞書（固定コミット`74790861f652b15e4ac49015a90074ad62a27690`）を使用しています。ライセンスは`assets/cmudict/LICENSE`を参照してください。
 
-依存APIは`Cargo.lock`に固定されています。主要な外部APIは[rodio 0.21.1](https://docs.rs/rodio/0.21.1/rodio/)、[ONNX Runtime](https://onnxruntime.ai/)、[Wav2Vec2 Base 960h](https://huggingface.co/facebook/wav2vec2-base-960h)を参照してください。
+依存APIは`Cargo.lock`に固定されています。主要な外部APIは[rodio 0.21.1](https://docs.rs/rodio/0.21.1/rodio/)、[ONNX Runtime](https://onnxruntime.ai/)、[Wav2Vec2 Base 960h](https://huggingface.co/facebook/wav2vec2-base-960h)を参照してください。音声のデコード・前処理・再エンコードは外部プロセスに頼らず、[Symphonia](https://github.com/pdeljanov/Symphonia)（デコード）、[rubato](https://docs.rs/rubato/)（リサンプリング）、[flacenc](https://docs.rs/flacenc/)（FLACエンコード）、[mp3lame-encoder](https://docs.rs/mp3lame-encoder/)（MP3エンコード、LAMEバインディング）で行います。
 
 設計は [docs/design.md](docs/design.md)、実装状況は [docs/implementation-status.md](docs/implementation-status.md) に記載しています。
