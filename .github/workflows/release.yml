@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      # ONNX Runtime DLLは配布物として必須だが、リポジトリには含めていない
+      # （.gitignore対象）。README記載の利用者向け手順と同じスクリプトで
+      # このジョブでも取得することで、手順自体の検証も兼ねる。
+      - name: Fetch ONNX Runtime DLLs
+        shell: cmd
+        run: runtime\download-onnx-runtime.cmd
+
+      - name: Stage distribution contents
+        shell: pwsh
+        run: |
+          $dist = "dist/benzaiten"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          New-Item -ItemType Directory -Force -Path "$dist/models" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$dist/licenses" | Out-Null
+
+          Copy-Item target/release/benzaiten.exe $dist
+          Copy-Item target/release/benzaiten-cli.exe $dist
+          Copy-Item runtime/onnxruntime.dll $dist
+          Copy-Item runtime/onnxruntime_providers_shared.dll $dist
+          # ort のビルドスクリプトが追加のDLLをtarget/release直下へ置く
+          # 場合に備えて、既に取得済み以外の.dllも念のため拾っておく。
+          Get-ChildItem target/release/*.dll -ErrorAction SilentlyContinue |
+            Where-Object { -not (Test-Path (Join-Path $dist $_.Name)) } |
+            Copy-Item -Destination $dist
+
+          Copy-Item models/download-forced-alignment-model.cmd "$dist/models"
+          Copy-Item models/download-japanese-alignment-model.cmd "$dist/models"
+
+          Copy-Item README.md $dist
+          Copy-Item LICENSE "$dist/licenses/LICENSE.txt"
+          Copy-Item THIRD_PARTY_NOTICES.txt $dist
+          Copy-Item assets/cmudict/LICENSE "$dist/licenses/CMUdict-LICENSE.txt"
+
+          $version = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev" }
+          $zipName = "benzaiten-$version-windows-x86_64.zip"
+          Compress-Archive -Path "$dist/*" -DestinationPath $zipName
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "${{ github.ref_name }}" "${{ env.ZIP_NAME }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

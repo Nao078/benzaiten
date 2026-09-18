@@ -1,0 +1,41 @@
+Benzaiten サードパーティ告知
+====================================
+
+このアプリ本体（LICENSE参照）とは別に、以下のオープンソース資源を利用しています。
+配布zipにはこれらのバイナリ・辞書データがビルド時に組み込まれていますが、
+歌唱同期用のWav2Vec2 ONNXモデルは含まれていません（README記載の方法で別途取得してください）。
+
+## 動的リンク・実行時読込（DLL本体は同梱）
+
+- ONNX Runtime (Microsoft) — MIT License
+  https://github.com/microsoft/onnxruntime
+  `onnxruntime.dll` / `onnxruntime_providers_shared.dll` を実行時に読み込みます。
+
+## 静的リンク（実行ファイルに組み込み）
+
+- LAME (mp3lame-encoder / mp3lame-sys 経由) — LGPL-2.1（ラッパークレート自体はLGPL-3.0表記）
+  https://lame.sourceforge.io/
+  MP3エンコードに使用し、ソースからビルドして静的リンクしています。本プロジェクトは
+  MITライセンスでソース全体を公開しており（LAMEのバージョンは`Cargo.lock`で固定）、
+  異なるバージョンのLAMEへ差し替えて再ビルドすることが誰でも可能です。
+
+- CMUdict (Carnegie Mellon University Speech Group) — 固定コミット
+  74790861f652b15e4ac49015a90074ad62a27690
+  歌唱向けカタカナ自動生成のため、辞書データを実行ファイルへ埋め込んでいます。
+  ライセンス全文は同梱の `licenses/CMUdict-LICENSE.txt` を参照してください。
+
+## Rustクレート（MIT / Apache-2.0 / MPL-2.0 いずれか、静的リンク）
+
+- Symphonia — MPL-2.0 (https://github.com/pdeljanov/Symphonia)
+- rubato — MIT (https://github.com/HEnquist/rubato)
+- flacenc — Apache-2.0 (https://github.com/yotarok/flacenc-rs)
+- ort / ONNX Runtime bindings — MIT OR Apache-2.0 (https://github.com/pykeio/ort)
+- windows crate — MIT OR Apache-2.0 (https://github.com/microsoft/windows-rs)
+- egui / eframe / egui-winit — MIT OR Apache-2.0 (https://github.com/emilk/egui)
+- rodio — MIT OR Apache-2.0 (https://github.com/RustAudio/rodio)
+- rfd — MIT (https://github.com/PolyMeilex/rfd)
+- lofty — MIT OR Apache-2.0 (https://github.com/Serial-ATA/lofty-rs)
+- image / image-webp — MIT OR Apache-2.0 (https://github.com/image-rs/image)
+- hound — Apache-2.0 (https://github.com/ruuda/hound)
+
+各クレートの正確なバージョンは同梱の`Cargo.lock`相当（GitHubリポジトリ）で確認できます。

@@ -1,0 +1,9 @@
+/target/
+/.tmp/
+*.gguf
+ggml-*.bin
+model
+/ffmpeg/
+/models/*.onnx
+/models/*.json
+/runtime/*.dll
