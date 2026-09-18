@@ -62,3 +62,27 @@ fn convert_wav_to_mp3_round_trips() {
     // MP3のエンコーダ遅延分だけ長くなるので、多少の増加は許容する。
     assert!(decoded.interleaved.len() >= 88_200);
 }
+
+/// Windows Media Foundation経由のAACエンコード。このアプリはWindows
+/// 専用なので、このテストも`cfg(windows)`のときだけコンパイルする。
+#[cfg(windows)]
+#[test]
+fn convert_wav_to_m4a_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("src.wav");
+    make_test_wav(&wav_path);
+
+    let m4a_path = dir.path().join("out.m4a");
+    benzaiten::audio::convert::to_m4a(&wav_path, &m4a_path).unwrap();
+    assert!(std::fs::metadata(&m4a_path).unwrap().len() > 100);
+
+    let decoded = benzaiten::audio::preprocess::decode(&m4a_path, None).unwrap();
+    assert_eq!(decoded.channels, 2);
+    assert_eq!(decoded.sample_rate, 44_100);
+    // AACはエンコーダ遅延（1024サンプル程度）が付くため、多少の増減を許容する。
+    let frames = decoded.interleaved.len() / 2;
+    assert!(
+        frames.abs_diff(44_100) < 4_096,
+        "unexpected frame count: {frames}"
+    );
+}

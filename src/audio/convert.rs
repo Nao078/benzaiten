@@ -1,10 +1,9 @@
 //! 可逆音源（WAV/FLAC）を、タグ埋め込み用の別形式へ再エンコードする処理。
 //! `preprocess::decode`でデコードし、チャンネル数・サンプルレートは
 //! そのまま保って再エンコードする（Forced Alignment前処理とは異なり、
-//! モノラル化・16kHz化は行わない）。
-//!
-//! M4A（AAC）への変換は実用的な純Rustエンコーダが無いため、ここでは
-//! 未対応（別タスクでWindows Media Foundation連携として実装予定）。
+//! モノラル化・16kHz化は行わない）。M4A（AAC）だけは、対応するチャンネル
+//! 数・サンプルレートが決まっているOSエンコーダの制約上、必要なら
+//! `to_m4a`内でチャンネル数・サンプルレートを寄せてから変換する。
 
 use std::path::Path;
 
@@ -99,4 +98,12 @@ pub fn to_mp3(input: &Path, output: &Path) -> Result<(), String> {
 
     std::fs::write(output, mp3_out)
         .map_err(|error| format!("could not write {}: {error}", output.display()))
+}
+
+/// 可逆音源をM4A（AAC-LC）へ再エンコードし、`output`へ書き出す。
+/// Windows Media Foundation標準搭載のAACエンコーダを使う（`aac_windows`
+/// 参照）ため、追加のバイナリ配布やライセンス条件は発生しない。
+#[cfg(windows)]
+pub fn to_m4a(input: &Path, output: &Path) -> Result<(), String> {
+    super::aac_windows::to_m4a(input, output)
 }

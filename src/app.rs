@@ -72,17 +72,6 @@ impl AudioTagFormat {
             AudioTagFormat::M4a => "M4A",
         }
     }
-
-    /// 可逆音源からの変換（[`convert_audio`](crate::audio::convert)）に
-    /// 対応しているかどうか。M4A（AAC）エンコードは純Rustの実用的な
-    /// エンコーダが無く、Windows Media Foundation連携は別タスクとして
-    /// 後回しにしているため、現時点では未対応。
-    fn supports_lossless_conversion(self) -> bool {
-        match self {
-            AudioTagFormat::Mp3WithLrc | AudioTagFormat::Flac => true,
-            AudioTagFormat::M4a => false,
-        }
-    }
 }
 
 /// `path`の拡張子から、対応する[`AudioTagFormat`]を推測する。サブメニューで
@@ -952,9 +941,7 @@ impl BenzaitenApp {
                 crate::audio::convert::to_mp3(&self.project.audio_path, &target_path)?;
             }
             AudioTagFormat::M4a => {
-                return Err(
-                    "M4Aへの変換は現在未対応です（今後のアップデートで対応予定）".to_owned(),
-                );
+                crate::audio::convert::to_m4a(&self.project.audio_path, &target_path)?;
             }
         }
         Ok(target_path)
@@ -1235,10 +1222,7 @@ impl eframe::App for BenzaitenApp {
                             ("FLAC", AudioTagFormat::Flac),
                             ("M4A", AudioTagFormat::M4a),
                         ] {
-                            // M4A（AAC）への変換は未対応（別タスク）なので、
-                            // 既にM4Aの音声を読み込んでいる場合のみ有効にする。
-                            let enabled = detected == Some(format)
-                                || (lossless_source && format.supports_lossless_conversion());
+                            let enabled = detected == Some(format) || lossless_source;
                             if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                                 command = Some(AppCommand::WriteAudioTags(format));
                             }

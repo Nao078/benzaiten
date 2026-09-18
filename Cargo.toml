@@ -32,6 +32,16 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "
 [target.'cfg(not(all(target_os = "windows", target_env = "gnu")))'.dependencies]
 ort = { version = "=2.0.0-rc.13" }
 
+# M4A（AAC）変換専用。OS標準搭載のMedia Foundation AACエンコーダを直接
+# 呼び出すため、追加のバイナリ配布や第三者ライブラリのライセンス条件が
+# 発生しない（このアプリはWindows専用なので、target_os依存にしている）。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_Foundation",
+    "Win32_System_Com",
+] }
+
 [[bin]]
 name = "benzaiten"
 path = "src/main.rs"

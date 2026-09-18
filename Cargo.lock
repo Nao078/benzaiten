@@ -361,6 +361,7 @@ dependencies = [
  "symphonia",
  "tempfile",
  "unicode-normalization",
+ "windows 0.58.0",
 ]
 
 [[package]]

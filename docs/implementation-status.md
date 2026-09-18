@@ -24,18 +24,19 @@
 | T20 | 実装済み | 常設メニューバーと保存ショートカット、原文・カタカナ2トラックのドラッグ編集タイムライン、Ctrl+ホイール拡大縮小。 |
 | T21 | 実装済み | 左ペインを音声・原文・カタカナ入力へ変更し、中央一覧を現在行に集中した可変ms時刻補正UIへ変更。 |
 | T22 | 実装済み | タイムラインの左右端ドラッグによる開始・終了個別調整、再生位置追従、右クリックでの追従移動トグルなど編集UXの改善。歌詞テキストの空行破棄。音声タグ書込みをメニューの`MP3 + LRC`/`FLAC`/`M4A`サブメニューへ再編し、FLAC/M4Aへの同期歌詞埋め込み（`ItemKey::Lyrics`）とMP3の`.lrc`併用出力を追加。可逆音源（WAV/FLAC）読み込み時は他形式へ変換してから書き込む機能も追加（非可逆音源からの変換は二重圧縮を避けるため提供しない）。 |
-| T23 | 実装済み | 外部ffmpegバイナリへの依存を排除。前処理を`Symphonia`（デコード）＋`rubato`（16kHzリサンプリング）による純Rust実装へ置換し、`ToolSettings`/CLI引数からffmpegパスを削除。可逆音源からのタグ埋め込み用変換もFLACは`flacenc`、MP3はLAME（`mp3lame-encoder`、LGPL）による純Rust/軽量バインディング実装へ置換。M4A（AAC）への変換のみ実用的な純Rustエンコーダが無く未対応（メニュー上で無効化、既存M4A音声への直接タグ埋め込みは可能）。汎用サブプロセス実行モジュール（`src/process.rs`）は用途が無くなったため削除。 |
+| T23 | 実装済み | 外部ffmpegバイナリへの依存を排除。前処理を`Symphonia`（デコード）＋`rubato`（16kHzリサンプリング）による純Rust実装へ置換し、`ToolSettings`/CLI引数からffmpegパスを削除。可逆音源からのタグ埋め込み用変換もFLACは`flacenc`、MP3はLAME（`mp3lame-encoder`、LGPL）による純Rust/軽量バインディング実装へ置換。汎用サブプロセス実行モジュール（`src/process.rs`）は用途が無くなったため削除。 |
+| T24 | 実装済み | M4A（AAC）への変換を実装（`src/audio/aac_windows.rs`）。Windows Media Foundation標準搭載のAACエンコーダを`windows`クレート・`IMFSinkWriter`経由で直接呼び出すため、追加バイナリの配布やライセンス条件は発生しない。「音声ファイルへタグを書き込む」メニューのM4A項目を可逆音源からの変換にも対応させ、`AudioTagFormat::supports_lossless_conversion`による無効化を撤廃。実音声での変換→デコード往復、および変換後にタグ・歌詞埋め込みまで通しての実機検証を実施。 |
 
 ## 検証環境
 
 Windows のローカル検証は Rust GNU クロスビルドで実施しました。GNUビルドではONNX Runtime 1.25.1をDLLとして動的ロードします。通常の開発環境には Rust の MSVC ツールチェーンと Visual Studio Build Tools（Windows SDK を含む）を推奨します。
 
-- Windows向け `cargo test`: 35件成功。
+- Windows向け `cargo test`: 36件成功。
 - Windows向け `cargo clippy --all-targets -- -D warnings`: 成功。
 - `cargo fmt --all -- --check`: 成功。
 - GUI実行ファイルを起動し、ウィンドウ生成と起動時エラーがないことを確認。
 - 日本語ONNXモデルと2341語彙tokenizerを実ロードし、Windows上で推論・Forced Alignment・LRC出力を通し確認。
-- Windows実機（クロスビルド、WSL2 Interop経由で実プロセスとして実行）で、ffmpeg抜きの新前処理パイプライン（Symphonia＋rubato）を含めONNX Runtime、Wav2Vec2、CTC、LRCまで通し検証済み。FLAC/MP3再エンコード（`flacenc`/LAME）も実音声で往復デコード確認済み。
+- Windows実機（クロスビルド、WSL2 Interop経由で実プロセスとして実行）で、ffmpeg抜きの新前処理パイプライン（Symphonia＋rubato）を含めONNX Runtime、Wav2Vec2、CTC、LRCまで通し検証済み。FLAC/MP3/M4A再エンコード（`flacenc`/LAME/Media Foundation）も実音声で往復デコード確認済み。M4Aは`ffprobe`による外部検証、および変換後のタグ・歌詞埋め込みまでの一気通貫も確認済み。
 - Windows向けCI設定を追加。リモートCIは未実行。
 
 `.tmp` はサンプル・作業用でGit管理対象外です。他のPCでは通常のRust開発環境を用意してください。

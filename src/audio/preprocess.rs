@@ -43,11 +43,7 @@ pub fn to_pcm16_mono_16khz(
 ) -> Result<(), String> {
     let decoded = decode(input, Some(&cancel))?;
     let mono = downmix_to_mono(&decoded.interleaved, decoded.channels);
-    let resampled = if decoded.sample_rate == TARGET_SAMPLE_RATE {
-        mono
-    } else {
-        resample_mono(&mono, decoded.sample_rate, TARGET_SAMPLE_RATE)?
-    };
+    let resampled = resample_interleaved(&mono, 1, decoded.sample_rate, TARGET_SAMPLE_RATE)?;
     write_pcm16_wav(output, &resampled)
 }
 
@@ -146,30 +142,74 @@ fn downmix_to_mono(interleaved: &[f32], channels: u16) -> Vec<f32> {
         .collect()
 }
 
-/// モノラルのf32サンプル列を`from_rate`から`to_rate`へリサンプリングする。
-fn resample_mono(input: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>, String> {
-    let mut resampler =
-        FftFixedIn::<f32>::new(from_rate as usize, to_rate as usize, RESAMPLE_CHUNK, 1, 1)
-            .map_err(|error| format!("could not initialize resampler: {error}"))?;
+/// インターリーブされた（1チャンネル以上の）f32サンプル列を`from_rate`
+/// から`to_rate`へリサンプリングする。`channels`個のチャンネルをまとめて
+/// 同じresamplerに通すことで、チャンネル間の時間的なずれが生じないように
+/// している。`from_rate == to_rate`の場合はそのまま返す。
+pub fn resample_interleaved(
+    interleaved: &[f32],
+    channels: u16,
+    from_rate: u32,
+    to_rate: u32,
+) -> Result<Vec<f32>, String> {
+    if from_rate == to_rate {
+        return Ok(interleaved.to_vec());
+    }
+    let channels = usize::from(channels).max(1);
+    let frames = interleaved.len() / channels;
+    let mut resampler = FftFixedIn::<f32>::new(
+        from_rate as usize,
+        to_rate as usize,
+        RESAMPLE_CHUNK,
+        1,
+        channels,
+    )
+    .map_err(|error| format!("could not initialize resampler: {error}"))?;
 
-    let mut output = Vec::new();
+    // チャンネルごとの連続バッファへ組み直す（rubatoはチャンネル別の
+    // スライスを要求するため）。
+    let mut per_channel: Vec<Vec<f32>> = vec![Vec::with_capacity(frames); channels];
+    for frame in interleaved.chunks(channels) {
+        for (channel, &sample) in frame.iter().enumerate() {
+            per_channel[channel].push(sample);
+        }
+    }
+
+    let mut resampled_channels: Vec<Vec<f32>> = vec![Vec::new(); channels];
     let mut position = 0;
-    while position < input.len() {
-        let end = (position + RESAMPLE_CHUNK).min(input.len());
-        let mut chunk = input[position..end].to_vec();
-        chunk.resize(RESAMPLE_CHUNK, 0.0);
+    while position < frames {
+        let end = (position + RESAMPLE_CHUNK).min(frames);
+        let chunks: Vec<Vec<f32>> = per_channel
+            .iter()
+            .map(|channel| {
+                let mut chunk = channel[position..end].to_vec();
+                chunk.resize(RESAMPLE_CHUNK, 0.0);
+                chunk
+            })
+            .collect();
         let produced = resampler
-            .process(&[chunk], None)
+            .process(&chunks, None)
             .map_err(|error| format!("resampling failed: {error}"))?;
-        output.extend_from_slice(&produced[0]);
+        for (output, produced) in resampled_channels.iter_mut().zip(produced) {
+            output.extend_from_slice(&produced);
+        }
         position = end;
     }
     // 最後のチャンクをゼロ埋めした分だけ余分な無音が末尾に付くので、
     // 想定される出力長へ切り詰める。
-    let expected_len =
-        (input.len() as f64 * f64::from(to_rate) / f64::from(from_rate)).round() as usize;
-    output.truncate(expected_len);
-    Ok(output)
+    let expected_frames =
+        (frames as f64 * f64::from(to_rate) / f64::from(from_rate)).round() as usize;
+    for channel in &mut resampled_channels {
+        channel.truncate(expected_frames);
+    }
+
+    let mut result = Vec::with_capacity(expected_frames * channels);
+    for frame in 0..expected_frames {
+        for channel in &resampled_channels {
+            result.push(channel[frame]);
+        }
+    }
+    Ok(result)
 }
 
 /// モノラルf32サンプル列を16bit PCM WAVとして書き出す。
