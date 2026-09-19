@@ -18,6 +18,8 @@ use symphonia::core::{
 };
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
+/// ボーカル分離モデル（`vocal_separation`）が要求するサンプルレート。
+const SEPARATOR_SAMPLE_RATE: u32 = 44_100;
 /// resamplerへ一度に渡す入力フレーム数。値自体に強い意味は無く、
 /// 精度と処理速度のバランスの取れた大きさであれば良い。
 const RESAMPLE_CHUNK: usize = 2048;
@@ -42,9 +44,27 @@ pub fn to_pcm16_mono_16khz(
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let decoded = decode(input, Some(&cancel))?;
+    write_pcm16_mono_16khz(&decoded, output)
+}
+
+/// デコード済みの音声（任意のチャンネル数・サンプルレート）を、
+/// Wav2Vec2が要求する16kHzモノラルPCM16 WAVへ変換して書き出す。
+/// ボーカル分離を経由した音声など、ファイルを介さずに得た
+/// [`DecodedAudio`]からもForced Alignment用WAVを作れるようにするため、
+/// [`to_pcm16_mono_16khz`]の後半をこの関数として切り出している。
+pub fn write_pcm16_mono_16khz(decoded: &DecodedAudio, output: &Path) -> Result<(), String> {
     let mono = downmix_to_mono(&decoded.interleaved, decoded.channels);
     let resampled = resample_interleaved(&mono, 1, decoded.sample_rate, TARGET_SAMPLE_RATE)?;
     write_pcm16_wav(output, &resampled)
+}
+
+/// デコード済みの音声を、ボーカル分離モデル（`vocal_separation`）が
+/// 要求する44.1kHzステレオへ変換する。モノラル音源はチャンネル変換で
+/// ステレオへ複製してから（`rubato`のリサンプラーを1回で済ませるため、
+/// サンプルレート変換より先にチャンネル変換を行う）リサンプリングする。
+pub fn to_stereo_44100(decoded: &DecodedAudio) -> Result<Vec<f32>, String> {
+    let stereo = resample_channels(&decoded.interleaved, decoded.channels, 2);
+    resample_interleaved(&stereo, 2, decoded.sample_rate, SEPARATOR_SAMPLE_RATE)
 }
 
 /// 入力ファイルを全チャンネル保持したままデコードする。`audio::convert`
@@ -135,10 +155,28 @@ pub fn decode(input: &Path, cancel: Option<&AtomicBool>) -> Result<DecodedAudio,
 /// インターリーブされたマルチチャンネルのf32サンプル列を、フレームごとの
 /// 平均を取ってモノラルへダウンミックスする。
 fn downmix_to_mono(interleaved: &[f32], channels: u16) -> Vec<f32> {
-    let channels = usize::from(channels).max(1);
+    resample_channels(interleaved, channels, 1)
+}
+
+/// インターリーブされたf32サンプル列のチャンネル数を変換する
+/// （フレームごとの平均を取り、必要なチャンネル数だけ複製・切り詰める
+/// 簡易実装）。モノラル→ステレオのような「複製」にも、多チャンネル→
+/// モノラルの「ダウンミックス」にも使える。`audio::aac_windows`の
+/// M4Aエンコード（チャンネル数の丸め）と`vocal_separation`の前処理
+/// （モノラル→ステレオ変換）の両方で共有する。
+pub(crate) fn resample_channels(
+    interleaved: &[f32],
+    from_channels: u16,
+    to_channels: u16,
+) -> Vec<f32> {
+    let from = usize::from(from_channels).max(1);
+    let to = usize::from(to_channels).max(1);
     interleaved
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .chunks(from)
+        .flat_map(|frame| {
+            let average = frame.iter().sum::<f32>() / from as f32;
+            std::iter::repeat_n(average, to)
+        })
         .collect()
 }
 
@@ -196,9 +234,14 @@ pub fn resample_interleaved(
         position = end;
     }
     // 最後のチャンクをゼロ埋めした分だけ余分な無音が末尾に付くので、
-    // 想定される出力長へ切り詰める。
-    let expected_frames =
-        (frames as f64 * f64::from(to_rate) / f64::from(from_rate)).round() as usize;
+    // 想定される出力長へ切り詰める。チャンク単位で処理するresamplerの
+    // 端数丸めにより、実際に生成される長さが計算上の期待値より1サンプル
+    // 程度少ないことがあるため、実際に生成された長さも上限として使う
+    // （超過分を読もうとしてpanicしないようにするため）。
+    let produced_frames = resampled_channels.iter().map(Vec::len).min().unwrap_or(0);
+    let expected_frames = ((frames as f64 * f64::from(to_rate) / f64::from(from_rate)).round()
+        as usize)
+        .min(produced_frames);
     for channel in &mut resampled_channels {
         channel.truncate(expected_frames);
     }
@@ -232,4 +275,34 @@ fn write_pcm16_wav(output: &Path, samples: &[f32]) -> Result<(), String> {
     writer
         .finalize()
         .map_err(|error| format!("could not finalize {}: {error}", output.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resample_interleaved;
+
+    /// 44.1kHz→16kHzのように、`RESAMPLE_CHUNK`単位で処理する
+    /// resamplerが実際に生成する長さは、チャンクごとの端数丸めが
+    /// 積み重なるため、`frames * to_rate / from_rate`の四捨五入で
+    /// 計算した期待長より（曲全体の長さに対してごくわずかだが）
+    /// 短くなることがある。以前はこの差を考慮しておらず、
+    /// `result.push(channel[frame])`がインデックス範囲外でpanicして
+    /// いた（実際に3分36秒・44.1kHzステレオの曲を16kHzへ変換した際に
+    /// 発生を確認済み。実測では期待長3,457,730に対し実際の生成長は
+    /// 3,457,600で、差は130サンプル＝8ミリ秒程度だった）。
+    #[test]
+    fn resampling_does_not_panic_when_resampler_underproduces() {
+        let frames = 9_530_368_usize;
+        let mono = vec![0.0_f32; frames];
+        let resampled = resample_interleaved(&mono, 1, 44_100, 16_000).unwrap();
+        let expected = (frames as f64 * 16_000.0 / 44_100.0).round() as usize;
+        // 短くなることはあっても、曲全体の長さに対してごくわずか
+        // （0.1%未満）でなければならない。
+        assert!(resampled.len() <= expected);
+        let shortfall = expected - resampled.len();
+        assert!(
+            (shortfall as f64) < expected as f64 * 0.001,
+            "resampled output was {shortfall} frames short of the expected {expected}"
+        );
+    }
 }

@@ -6,6 +6,8 @@ pub mod convert;
 pub mod player;
 /// 任意の入力音声を、Wav2Vec2モデルが要求する16kHzモノラルPCM16 WAVへ変換する。
 pub mod preprocess;
+/// Forced Alignmentの前処理として、伴奏からボーカルを分離する（任意機能）。
+pub mod vocal_separation;
 
 /// Windows Media Foundation標準搭載のAACエンコーダを使ったM4A書き出し
 /// （`convert::to_m4a`から使う）。このアプリはWindows専用なので、

@@ -20,7 +20,12 @@ pub fn align(
     frame_duration_ms: f64,
 ) -> Result<Vec<LyricLine>, String> {
     let transcript = tokenizer::tokenize_english(lyrics)?;
-    let aligned = trellis::force_align(emissions, &transcript.token_ids, tokenizer::BLANK_ID)?;
+    let aligned = trellis::force_align(
+        emissions,
+        &transcript.token_ids,
+        tokenizer::BLANK_ID,
+        frame_duration_ms,
+    )?;
     resolver::resolve_lines(lyrics, &transcript, &aligned, frame_duration_ms)
 }
 
@@ -33,6 +38,11 @@ pub fn align_japanese(
     vocabulary: &tokenizer::Vocabulary,
 ) -> Result<Vec<LyricLine>, String> {
     let transcript = tokenizer::tokenize_japanese(lyrics, vocabulary)?;
-    let aligned = trellis::force_align(emissions, &transcript.token_ids, vocabulary.blank_id)?;
+    let aligned = trellis::force_align(
+        emissions,
+        &transcript.token_ids,
+        vocabulary.blank_id,
+        frame_duration_ms,
+    )?;
     resolver::resolve_lines(lyrics, &transcript, &aligned, frame_duration_ms)
 }

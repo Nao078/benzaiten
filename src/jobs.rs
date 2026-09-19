@@ -22,11 +22,15 @@ pub struct ToolSettings {
     pub vocabulary: Option<PathBuf>,
     pub language: String,
     pub threads: usize,
+    /// ボーカル分離モデルのパス。`None`なら分離ステージを無効化する
+    /// （既定は無効：処理時間が増えるため任意のオプトイン機能とする）。
+    pub vocal_separator: Option<PathBuf>,
 }
 
 impl ToolSettings {
     /// 実行前に、選択言語に応じて必要なモデル・語彙ファイルが揃っているか
     /// 検証する。日本語の場合は`vocabulary`（tokenizer.json）が必須。
+    /// ボーカル分離が有効な場合はそのモデルファイルの存在も確認する。
     pub fn validate_model(&self, lyrics: &[LyricLine]) -> Result<(), String> {
         if self.model.as_os_str().is_empty() {
             return Err("Forced Alignmentモデルが未設定です。「外部ツール設定」→「モデル」→「参照」で、Wav2Vec2 ONNXモデルを選択してください。".into());
@@ -47,6 +51,14 @@ impl ToolSettings {
                 ));
             }
         }
+        if let Some(separator) = &self.vocal_separator {
+            if !separator.is_file() {
+                return Err(format!(
+                    "ボーカル分離モデルが見つかりません: {}。「外部ツール設定」からファイルを選び直すか、ボーカル分離を無効化してください。",
+                    separator.display()
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -58,6 +70,7 @@ impl Default for ToolSettings {
             vocabulary: None,
             language: "en".to_owned(),
             threads: 8,
+            vocal_separator: None,
         }
     }
 }
@@ -160,8 +173,33 @@ fn run_with_events(
         .tempdir()
         .map_err(|error| format!("could not create temporary directory: {error}"))?;
     let wav = temporary.path().join("audio-16k-mono.wav");
+
+    let decoded = crate::audio::preprocess::decode(audio, Some(&cancel))?;
+    check_cancelled(&cancel)?;
+    let prepared = if let Some(separator_path) = &settings.vocal_separator {
+        stage("ボーカルを分離中");
+        let stereo_44100 = crate::audio::preprocess::to_stereo_44100(&decoded)?;
+        let mut separator =
+            crate::audio::vocal_separation::OnnxHtDemucs::load(separator_path, settings.threads)?;
+        let mut report_progress = |percent| stage(&format!("ボーカルを分離中: {percent}%"));
+        let vocals = crate::audio::vocal_separation::VocalSeparator::separate(
+            &mut separator,
+            &stereo_44100,
+            Arc::clone(&cancel),
+            &mut report_progress,
+        )?;
+        crate::audio::preprocess::DecodedAudio {
+            interleaved: vocals,
+            sample_rate: 44_100,
+            channels: 2,
+        }
+    } else {
+        decoded
+    };
+    check_cancelled(&cancel)?;
+
     stage("音声を変換中");
-    crate::audio::preprocess::to_pcm16_mono_16khz(audio, &wav, Arc::clone(&cancel))?;
+    crate::audio::preprocess::write_pcm16_mono_16khz(&prepared, &wav)?;
     check_cancelled(&cancel)?;
 
     stage("Forced Alignmentモデルを読み込み中");

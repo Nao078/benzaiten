@@ -18,12 +18,13 @@ fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() < 4 {
         return Err(
-            "Usage: benzaiten-cli <audio> <lyrics.txt> <wav2vec2.onnx> <output.lrc> [--language auto|en|jp] [--vocabulary <tokenizer.json>] [--generate-reading | --reading <katakana.txt>]"
+            "Usage: benzaiten-cli <audio> <lyrics.txt> <wav2vec2.onnx> <output.lrc> [--language auto|en|jp] [--vocabulary <tokenizer.json>] [--vocal-separator <htdemucs.onnx>] [--generate-reading | --reading <katakana.txt>]"
                 .into(),
         );
     }
     let mut language = "en".to_owned();
     let mut vocabulary = None;
+    let mut vocal_separator = None;
     let mut reading_path = None;
     let mut generate_reading = false;
     // 位置引数（4個）の後ろに続く任意のオプションを解析する。
@@ -36,6 +37,10 @@ fn run() -> Result<(), String> {
             }
             "--vocabulary" if index + 1 < args.len() => {
                 vocabulary = Some(PathBuf::from(&args[index + 1]));
+                index += 2;
+            }
+            "--vocal-separator" if index + 1 < args.len() => {
+                vocal_separator = Some(PathBuf::from(&args[index + 1]));
                 index += 2;
             }
             "--reading" if index + 1 < args.len() => {
@@ -59,6 +64,7 @@ fn run() -> Result<(), String> {
         vocabulary,
         language,
         threads: 8,
+        vocal_separator,
     };
     let mut lyrics = parse_lyrics(&text);
     if let Some(path) = reading_path {

@@ -25,7 +25,7 @@ use windows::{
     },
 };
 
-use super::preprocess::{decode, resample_interleaved};
+use super::preprocess::{decode, resample_channels, resample_interleaved};
 
 /// AACエンコーダが受け付けるサンプルレート（`docs/design.md`参照）。
 const SUPPORTED_SAMPLE_RATES: [u32; 2] = [44_100, 48_000];
@@ -40,7 +40,7 @@ pub fn to_m4a(input: &Path, output: &Path) -> Result<(), String> {
     let interleaved = if channels == decoded.channels {
         decoded.interleaved
     } else {
-        downmix_to_channels(&decoded.interleaved, decoded.channels, channels)
+        resample_channels(&decoded.interleaved, decoded.channels, channels)
     };
     let interleaved =
         resample_interleaved(&interleaved, channels, decoded.sample_rate, sample_rate)?;
@@ -76,21 +76,6 @@ fn negotiate_format(channels: u16, sample_rate: u32) -> (u16, u32) {
         44_100
     };
     (channels, sample_rate)
-}
-
-/// 入力チャンネル数がAACエンコーダの対応範囲外だった場合に、
-/// 目標チャンネル数へダウンミックスする（フレームごとの平均を取り、
-/// 必要なチャンネル数だけ複製・切り詰める簡易実装）。
-fn downmix_to_channels(interleaved: &[f32], from_channels: u16, to_channels: u16) -> Vec<f32> {
-    let from = usize::from(from_channels).max(1);
-    let to = usize::from(to_channels).max(1);
-    interleaved
-        .chunks(from)
-        .flat_map(|frame| {
-            let average = frame.iter().sum::<f32>() / from as f32;
-            std::iter::repeat_n(average, to)
-        })
-        .collect()
 }
 
 unsafe fn encode(

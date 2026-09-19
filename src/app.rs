@@ -214,6 +214,7 @@ pub struct BenzaitenApp {
     japanese_vocabulary: String,
     language: String,
     alignment_threads: usize,
+    vocal_separator_model: String,
     project_path: Option<PathBuf>,
     /// 保存されていない変更があるかどうか。ウィンドウを閉じる際などの
     /// 破棄確認に使う。
@@ -277,6 +278,8 @@ impl BenzaitenApp {
             "models/wav2vec2-large-xlsr-53-japanese-tokenizer.json",
         ))
         .unwrap_or_else(|| PathBuf::from("models/wav2vec2-large-xlsr-53-japanese-tokenizer.json"));
+        let vocal_separator_model = find_project_file(Path::new("models/htdemucs-ft-vocals.onnx"))
+            .unwrap_or_else(|| PathBuf::from("models/htdemucs-ft-vocals.onnx"));
         Self {
             project: Project::default(),
             player: None,
@@ -292,6 +295,7 @@ impl BenzaitenApp {
             japanese_vocabulary: japanese_vocabulary.to_string_lossy().into_owned(),
             language: "auto".into(),
             alignment_threads: 8,
+            vocal_separator_model: vocal_separator_model.to_string_lossy().into_owned(),
             project_path: None,
             dirty: false,
             artwork_bytes: None,
@@ -522,7 +526,7 @@ impl BenzaitenApp {
     /// 「外部ツール設定」ダイアログの中身：歌詞言語の選択、各種モデルの
     /// パス設定、CPUスレッド数、配布元へのリンク。
     fn show_external_tools_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label("自動同期には選択言語のWav2Vec2 ONNXモデルが必要です。");
+        ui.label("歌詞への時刻の割り当てには選択言語のWav2Vec2 ONNXモデルが必要です。");
         let detected = crate::forced_alignment::tokenizer::detect_language(&self.project.lyrics);
         ui.horizontal(|ui| {
             ui.label("歌詞言語");
@@ -545,6 +549,7 @@ impl BenzaitenApp {
             ("英語ONNX", &mut self.model),
             ("日本語ONNX", &mut self.japanese_model),
             ("日本語tokenizer", &mut self.japanese_vocabulary),
+            ("ボーカル分離ONNX（任意）", &mut self.vocal_separator_model),
         ] {
             ui.horizontal(|ui| {
                 ui.label(label);
@@ -560,6 +565,10 @@ impl BenzaitenApp {
             ui.label("CPUスレッド");
             ui.add(egui::DragValue::new(&mut self.alignment_threads).range(1..=32));
         });
+        ui.small(
+            "「歌詞に時刻を割り当てる（高精度）」ボタンで使うボーカル分離モデルのパスです。\
+             伴奏の強い曲・激しくミックスされた曲で有効です。",
+        );
         ui.separator();
         ui.hyperlink_to(
             "英語モデル配布元",
@@ -569,6 +578,51 @@ impl BenzaitenApp {
             "日本語モデル配布元",
             "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-japanese-onnx",
         );
+        ui.hyperlink_to(
+            "ボーカル分離モデル配布元",
+            "https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx",
+        );
+    }
+
+    /// 歌詞言語を解決し、対応するモデル・語彙の設定を検証した上で、
+    /// Forced Alignmentパイプラインを非同期ジョブとして開始する。
+    /// `vocal_separator`に`Some`を渡すと、先にボーカルを分離してから
+    /// 整列する（処理時間は増えるが、伴奏の強い曲で精度が上がる）。
+    /// 開始時点の`generation`を`job_generation`に記録しておき、完了時に
+    /// 入力が変わっていないか確認できるようにする（`poll_job`参照）。
+    fn start_alignment_job(&mut self, vocal_separator: Option<PathBuf>) {
+        let language = crate::forced_alignment::tokenizer::resolve_language(
+            &self.language,
+            &self.project.lyrics,
+        );
+        let Ok(language) = language else {
+            self.status = language.unwrap_err();
+            return;
+        };
+        let japanese = language == crate::forced_alignment::tokenizer::AlignmentLanguage::Japanese;
+        let settings = ToolSettings {
+            model: if japanese {
+                self.japanese_model.clone().into()
+            } else {
+                self.model.clone().into()
+            },
+            vocabulary: japanese.then(|| self.japanese_vocabulary.clone().into()),
+            language: language.code().into(),
+            threads: self.alignment_threads,
+            vocal_separator,
+        };
+        match settings.validate_model(&self.project.lyrics) {
+            Err(error) => self.status = error,
+            Ok(()) => {
+                self.job_generation = self.generation;
+                self.job = Some(Job::start(
+                    self.project.audio_path.clone(),
+                    self.project.lyrics.clone(),
+                    settings,
+                ));
+                self.job_started_at = Some(Instant::now());
+            }
+        }
     }
 
     /// `timeline::show`が返した[`TimelineAction`]群を処理し、選択状態・
@@ -1483,7 +1537,19 @@ impl eframe::App for BenzaitenApp {
                     .inner
                     .changed();
                 ui.separator();
-                ui.strong("カタカナ歌詞（任意）");
+                ui.horizontal(|ui| {
+                    ui.strong("カタカナ歌詞（任意）");
+                    if ui
+                        .button("自動生成")
+                        .on_hover_text(
+                            "歌唱向けカタカナを自動生成します。手動入力・カタカナTXTから\
+                             読み込んだ行は上書きしません",
+                        )
+                        .clicked()
+                    {
+                        self.generate_readings();
+                    }
+                });
                 ui.small("同期判定には使用されません");
                 reading_input_changed = egui::ScrollArea::vertical()
                     .id_salt("reading-lyrics-scroll")
@@ -1574,7 +1640,7 @@ impl eframe::App for BenzaitenApp {
                 });
             });
         self.last_highlighted = active_index;
-        // --- 中央パネル：曲情報、歌詞表示切替、時刻補正、自動同期、
+        // --- 中央パネル：曲情報、歌詞表示切替、時刻補正、時刻の自動割り当て、
         //     下部固定の再生バー ---
         egui::CentralPanel::default().show(ctx, |ui| {
             // 再生バーの領域を先に中央エリア下部へ確保しておくことで、
@@ -1740,13 +1806,6 @@ impl eframe::App for BenzaitenApp {
                             LyricsDisplayMode::OriginalAndReading,
                             "原文 + カタカナ",
                         );
-                        if ui
-                            .button("歌唱向けカタカナ自動生成")
-                            .on_hover_text("手動入力・カタカナTXTから読み込んだ行は上書きしません")
-                            .clicked()
-                        {
-                            self.generate_readings();
-                        }
                     });
                     let active_index = self.player.as_ref().and_then(|player| {
                         active_lyric_index(&self.project.lyrics, player.position_ms())
@@ -1971,59 +2030,43 @@ impl eframe::App for BenzaitenApp {
                         self.changed();
                         self.sync_lyric_inputs_from_project();
                     }
-                    // 「自動同期」ボタン：歌詞言語を解決し、対応するモデル・
-                    // 語彙の設定を検証した上で、Forced Alignmentパイプライン
-                    // を非同期ジョブとして開始する。開始時点の`generation`を
-                    // `job_generation`に記録しておき、完了時に入力が変わって
-                    // いないか確認できるようにする（`poll_job`参照）。
+                    // 歌詞に時刻を割り当てるボタン（通常／高精度の2つ）。
+                    // 実処理は`start_alignment_job`が担う。
                     ui.horizontal(|ui| {
                         if self.job.is_some() {
-                            if ui.button("同期をキャンセル").clicked() {
+                            if ui.button("割り当てを中止").clicked() {
                                 if let Some(job) = &self.job {
                                     job.cancel();
                                     self.generation = self.generation.wrapping_add(1);
                                 }
                             }
-                        } else if ui
-                            .add_enabled(
-                                !self.project.audio_path.as_os_str().is_empty()
-                                    && !self.project.lyrics.is_empty(),
-                                egui::Button::new("自動同期"),
-                            )
-                            .clicked()
-                        {
-                            let language = crate::forced_alignment::tokenizer::resolve_language(
-                                &self.language,
-                                &self.project.lyrics,
-                            );
-                            let Ok(language) = language else {
-                                self.status = language.unwrap_err();
-                                return;
-                            };
-                            let japanese = language
-                                == crate::forced_alignment::tokenizer::AlignmentLanguage::Japanese;
-                            let settings = ToolSettings {
-                                model: if japanese {
-                                    self.japanese_model.clone().into()
-                                } else {
-                                    self.model.clone().into()
-                                },
-                                vocabulary: japanese
-                                    .then(|| self.japanese_vocabulary.clone().into()),
-                                language: language.code().into(),
-                                threads: self.alignment_threads,
-                            };
-                            match settings.validate_model(&self.project.lyrics) {
-                                Err(error) => self.status = error,
-                                Ok(()) => {
-                                    self.job_generation = self.generation;
-                                    self.job = Some(Job::start(
-                                        self.project.audio_path.clone(),
-                                        self.project.lyrics.clone(),
-                                        settings,
-                                    ));
-                                    self.job_started_at = Some(Instant::now());
-                                }
+                        } else {
+                            let enabled = !self.project.audio_path.as_os_str().is_empty()
+                                && !self.project.lyrics.is_empty();
+                            if ui
+                                .add_enabled(enabled, egui::Button::new("歌詞に時刻を割り当てる"))
+                                .on_hover_text(
+                                    "音声全体を解析し、歌詞の各行へ開始・終了時刻を自動で割り当てます。",
+                                )
+                                .clicked()
+                            {
+                                self.start_alignment_job(None);
+                            }
+                            if ui
+                                .add_enabled(
+                                    enabled,
+                                    egui::Button::new("歌詞に時刻を割り当てる（高精度）"),
+                                )
+                                .on_hover_text(
+                                    "先にボーカルを分離してから解析するため、伴奏の強い曲でも精度が\
+                                     上がります。処理時間は数十秒〜数分程度増えます\
+                                     （「外部ツール設定」でモデルのダウンロードが必要です）。",
+                                )
+                                .clicked()
+                            {
+                                self.start_alignment_job(Some(
+                                    self.vocal_separator_model.clone().into(),
+                                ));
                             }
                         }
                     });

@@ -50,6 +50,7 @@ zipにはexe・ONNX Runtime DLL・ライセンス表記一式（`licenses/`、`T
 
 - **英語**: `models\download-forced-alignment-model.cmd`を実行し、「外部ツール設定」から`models\wav2vec2-base-960h.onnx`を選択します。
 - **日本語**: `models\download-japanese-alignment-model.cmd`を実行します。[日本語Wav2Vec2 ONNX変換](https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-japanese-onnx)から約1.27GBのモデルとtokenizerを取得し、SHA-256を検証します。GUIは既定パスを自動検出します。語彙にない珍しい漢字は歌詞をひらがな・カタカナへ置き換えてください。モデルは音声認識用データで学習されているため、歌唱・伴奏条件によって同期精度は変わります。
+- **ボーカル分離（任意）**: `models\download-vocal-separation-model.cmd`を実行して[HT-Demucs ONNXモデル](https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx)（約166MB、SHA-256検証あり）を取得すると、「外部ツール設定」でパスが自動検出され、「歌詞に時刻を割り当てる（高精度）」ボタンが使えるようになります。伴奏の強い曲・激しくミックスされた曲では、Wav2Vec2（読み上げ音声で学習）がそのままだとconfidenceが全編にわたって低くなることがあり、先にボーカルだけを分離してから渡すことで大幅に改善する場合があります。CPUのみで動作しますが、曲の長さに応じて数十秒〜数分程度の処理時間が通常の割り当てより追加でかかります。
 - **GNU版Rustでビルドする場合**: `runtime\download-onnx-runtime.cmd`を一度実行し、生成された`onnxruntime.dll`と`onnxruntime_providers_shared.dll`を`benzaiten.exe`と同じディレクトリへ置いてください（配布zip・MSVCビルドには同梱済み）。
 
 ## 開発環境から実行する
@@ -71,6 +72,7 @@ cargo run --bin benzaiten-cli -- <audio> <lyrics.txt> <wav2vec2.onnx> <output.lr
 - `--reading <katakana.txt>`: 任意のカタカナ歌詞もプロジェクトJSONへ格納する。
 - `--generate-reading`: カタカナ歌詞を自動生成する（`--reading`の代わりに指定）。
 - 日本語同期では日本語モデルを第3引数へ渡し、`--language jp --vocabulary models\wav2vec2-large-xlsr-53-japanese-tokenizer.json`を追加する。
+- `--vocal-separator <htdemucs.onnx>`: 伴奏の強い曲でForced Alignmentの精度が低い場合、先にボーカルを分離してから整列する（任意、処理時間が増える）。
 
 CLIはLRCを出力する前に`<output>.json`のプロジェクトを保存します。未設定時刻などでLRC出力に失敗しても、手動補正用のJSONは残ります。
 
