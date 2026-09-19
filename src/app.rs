@@ -1332,17 +1332,94 @@ impl eframe::App for BenzaitenApp {
                     }
                     ui.separator();
                     let current_position = self.player.as_ref().map(AudioPlayer::position_ms);
+                    let has_previous = self.selected.is_some_and(|index| index > 0);
+                    let has_next = self
+                        .selected
+                        .is_some_and(|index| index + 1 < self.project.lyrics.len());
+                    // 4つのボタンでラベルの文字数が異なる（「[」「◀[」など）ため、
+                    // min_sizeで幅を揃えて見た目のガタつきを防ぐ。
+                    let timeline_button_size = egui::vec2(32.0, 0.0);
+                    // 隣接行との境界を再生位置に合わせる際、両方をぴったり同じ
+                    // 時刻にすると隙間ゼロで隣り合い、境界が判別しにくくなる。
+                    // 前後の歌詞との間に少しだけ間隔を空けておく。
+                    const BOUNDARY_GAP_MS: u64 = 100;
                     if ui
                         .add_enabled(
                             self.selected.is_some() && current_position.is_some(),
-                            egui::Button::new("現在の再生位置を開始時刻に設定"),
+                            egui::Button::new("[").min_size(timeline_button_size),
                         )
+                        .on_hover_text("現在の再生位置をこの行の開始時刻に設定する")
                         .clicked()
                     {
                         if let (Some(index), Some(position)) = (self.selected, current_position) {
                             lyric_editor::set_line_start(&mut self.project.lyrics, index, position);
                             self.changed();
                             self.status = "現在の再生位置を開始時刻に設定しました".into();
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            self.selected.is_some() && current_position.is_some() && has_previous,
+                            egui::Button::new("◀[").min_size(timeline_button_size),
+                        )
+                        .on_hover_text(
+                            "現在の再生位置をこの行の開始時刻にし、一つ前の歌詞の終了時刻にする\
+                             （前の歌詞との間に100ms程度の間隔を空ける）",
+                        )
+                        .clicked()
+                    {
+                        if let (Some(index), Some(position)) = (self.selected, current_position) {
+                            lyric_editor::set_line_start(&mut self.project.lyrics, index, position);
+                            lyric_editor::set_line_end(
+                                &mut self.project.lyrics,
+                                index - 1,
+                                position.saturating_sub(BOUNDARY_GAP_MS),
+                            );
+                            self.changed();
+                            self.status =
+                                "現在の再生位置を開始時刻にし、一つ前の歌詞の終了時刻にしました"
+                                    .into();
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            self.selected.is_some() && current_position.is_some() && has_next,
+                            egui::Button::new("]▶").min_size(timeline_button_size),
+                        )
+                        .on_hover_text(
+                            "現在の再生位置をこの行の終了時刻にし、一つ後の歌詞の開始時刻にする\
+                             （次の歌詞との間に100ms程度の間隔を空ける）",
+                        )
+                        .clicked()
+                    {
+                        if let (Some(index), Some(position)) = (self.selected, current_position) {
+                            lyric_editor::set_line_end(&mut self.project.lyrics, index, position);
+                            let next_start = position.saturating_add(BOUNDARY_GAP_MS);
+                            let next_start =
+                                timeline_duration.map_or(next_start, |d| next_start.min(d));
+                            lyric_editor::set_line_start(
+                                &mut self.project.lyrics,
+                                index + 1,
+                                next_start,
+                            );
+                            self.changed();
+                            self.status =
+                                "現在の再生位置を終了時刻にし、一つ後の歌詞の開始時刻にしました"
+                                    .into();
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            self.selected.is_some() && current_position.is_some(),
+                            egui::Button::new("]").min_size(timeline_button_size),
+                        )
+                        .on_hover_text("現在の再生位置をこの行の終了時刻に設定する")
+                        .clicked()
+                    {
+                        if let (Some(index), Some(position)) = (self.selected, current_position) {
+                            lyric_editor::set_line_end(&mut self.project.lyrics, index, position);
+                            self.changed();
+                            self.status = "現在の再生位置を終了時刻に設定しました".into();
                         }
                     }
                     ui.label(

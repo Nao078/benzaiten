@@ -45,6 +45,14 @@ pub fn set_line_start(lines: &mut [LyricLine], index: usize, ms: u64) {
     }
 }
 
+/// スライス内の位置（`index`）で指定した1行の終了時刻を設定する。
+/// [`set_line_start`]と対になる関数で、対象の行だけを変更する。
+pub fn set_line_end(lines: &mut [LyricLine], index: usize, ms: u64) {
+    if let Some(line) = lines.get_mut(index) {
+        set_end(line, ms);
+    }
+}
+
 /// `index`番目の行の開始時刻を相対量`delta`だけ動かす
 /// （[`set_line_start`]を介して行うので、前の行には影響しない）。
 pub fn shift_line_start(lines: &mut [LyricLine], index: usize, delta: i64, duration: Option<u64>) {
